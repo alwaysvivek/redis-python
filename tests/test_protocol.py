@@ -1,5 +1,5 @@
 import unittest
-from app.parser import parsed_resp_array
+from resp_server.parser import parsed_resp_array
 
 class TestParser(unittest.TestCase):
     def test_parsed_resp_array_empty(self):

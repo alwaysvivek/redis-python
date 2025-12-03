@@ -21,7 +21,7 @@ Examples:
     python -m app.main --port 6380 --replicaof localhost 6379
 """
 
-from app.core.server import main
+from resp_server.core.server import main
 
 if __name__ == "__main__":
     main()
