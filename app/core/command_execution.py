@@ -29,13 +29,13 @@ import sys
 import os
 import threading
 import time
-import math
+
 from app.parser import parsed_resp_array
 from app.core.datastore import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, BLOCKING_STREAMS, BLOCKING_STREAMS_LOCK, \
     CHANNEL_SUBSCRIBERS, DATA_LOCK, DATA_STORE, SORTED_SETS, STREAMS, WAIT_CONDITION, WAIT_LOCK, \
     _serialize_command_to_resp_array, add_to_sorted_set, cleanup_blocked_client, enqueue_client_command, \
     get_client_queued_commands, get_sorted_set_range, get_sorted_set_rank, get_stream_max_id, get_zscore, \
-    increment_key_value, is_client_in_multi, is_client_subscribed, load_rdb_to_datastore, lrange_rtn, \
+    increment_key_value, increment_key_value_by, delete_data_entry, is_client_in_multi, is_client_subscribed, load_rdb_to_datastore, lrange_rtn, \
     num_client_subscriptions, prepend_to_list, remove_elements_from_list, remove_from_sorted_set, set_client_in_multi, \
     size_of_list, append_to_list, existing_list, get_data_entry, set_list, set_string, subscribe, unsubscribe, xadd, \
     xrange, xread
@@ -45,160 +45,8 @@ from app.core.datastore import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, BLOCKING
 # ============================================================================
 
 # Commands that modify data and should be propagated to replicas
-WRITE_COMMANDS = {"SET", "LPUSH", "RPUSH", "LPOP", "ZADD", "ZREM", "XADD", "INCR", "GEOADD"}
+WRITE_COMMANDS = {"SET", "LPUSH", "RPUSH", "LPOP", "ZADD", "ZREM", "XADD", "INCR", "INCRBY", "DEL"}
 
-# Geospatial constants for coordinate validation and calculations
-MIN_LON = -180.0
-MAX_LON = 180.0
-MIN_LAT = -85.05112878
-MAX_LAT = 85.05112878
-
-LATITUDE_RANGE = MAX_LAT - MIN_LAT
-LONGITUDE_RANGE = MAX_LON - MIN_LON
-
-EARTH_RADIUS_M = 6372797.560856  # Earth radius in meters for Haversine formula
-
-
-# ============================================================================
-# GEOSPATIAL HELPER FUNCTIONS
-# ============================================================================
-# These functions support geospatial commands (GEOADD, GEOPOS, GEODIST, GEOSEARCH)
-# by providing coordinate conversion, distance calculation, and geohash encoding/decoding.
-
-def convert_to_meters(radius: float, unit: str) -> float:
-    """
-    Converts a radius value from a given unit to meters.
-    
-    Args:
-        radius: The radius value to convert
-        unit: The unit of measurement ('m', 'km', 'mi', 'ft')
-    
-    Returns:
-        The radius value in meters
-    
-    Raises:
-        ValueError: If the unit is not recognized
-    """
-    unit = unit.lower()
-    if unit == 'm':
-        return radius
-    elif unit == 'km':
-        return radius * 1000.0
-    elif unit == 'mi':
-        # 1 mile = 1609.344 meters (Redis constant)
-        return radius * 1609.344
-    elif unit == 'ft':
-        # 1 foot = 0.3048 meters
-        return radius * 0.3048
-    else:
-        raise ValueError("Invalid unit specified")
-
-
-def haversine_distance(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
-    """Calculates the distance between two points (lon, lat) using the Haversine formula."""
-    # Convert degrees to radians
-    lat1_rad = math.radians(lat1)
-    lon1_rad = math.radians(lon1)
-    lat2_rad = math.radians(lat2)
-    lon2_rad = math.radians(lon2)
-
-    # Differences
-    dlat = lat2_rad - lat1_rad
-    dlon = lon2_rad - lon1_rad
-
-    # Haversine formula calculation: a = sin²(dlat/2) + cos(lat1) * cos(lat2) * sin²(dlon/2)
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
-    # c = 2 * atan2(sqrt(a), sqrt(1-a)) simplifies to 2 * asin(sqrt(a))
-    c = 2 * math.asin(math.sqrt(a))
-
-    distance = EARTH_RADIUS_M * c
-    return distance
-
-
-def spread_int32_to_int64(v: int) -> int:
-    """Spreads bits of a 32-bit integer to occupy even positions in a 64-bit integer."""
-    v = v & 0xFFFFFFFF
-    v = (v | (v << 16)) & 0x0000FFFF0000FFFF
-    v = (v | (v << 8)) & 0x00FF00FF00FF00FF
-    v = (v | (v << 4)) & 0x0F0F0F0F0F0F0F0F
-    v = (v | (v << 2)) & 0x3333333333333333
-    v = (v | (v << 1)) & 0x5555555555555555
-    return v
-
-
-def interleave(x: int, y: int) -> int:
-    """Interleaves bits of two 32-bit integers to create a single 64-bit Morton code."""
-    x_spread = spread_int32_to_int64(x)
-    y_spread = spread_int32_to_int64(y)
-    y_shifted = y_spread << 1
-    return x_spread | y_shifted
-
-
-def encode_geohash(latitude: float, longitude: float) -> int:
-    """Encodes latitude and longitude into a single integer score using Morton encoding."""
-    # 2^26
-    power_26 = 1 << 26
-
-    # 1. Normalize to the range 0-2^26
-    normalized_latitude = power_26 * (latitude - MIN_LAT) / LATITUDE_RANGE
-    normalized_longitude = power_26 * (longitude - MIN_LON) / LONGITUDE_RANGE
-
-    # 2. Truncate to integers
-    lat_int = int(normalized_latitude)
-    lon_int = int(normalized_longitude)
-
-    # 3. Interleave bits
-    return interleave(lat_int, lon_int)
-
-
-def compact_int64_to_int32(v: int) -> int:
-    """
-    Compact a 64-bit integer with interleaved bits back to a 32-bit integer.
-    """
-    v = v & 0x5555555555555555
-    v = (v | (v >> 1)) & 0x3333333333333333
-    v = (v | (v >> 2)) & 0x0F0F0F0F0F0F0F0F
-    v = (v | (v >> 4)) & 0x00FF00FF00FF00FF
-    v = (v | (v >> 8)) & 0x0000FFFF0000FFFF
-    v = (v | (v >> 16)) & 0x00000000FFFFFFFF
-    return v
-
-
-def convert_grid_numbers_to_coordinates(grid_latitude_number: int, grid_longitude_number: int) -> tuple[float, float]:
-    """Converts grid numbers back to (longitude, latitude) coordinates (center of grid cell)."""
-    # 2**26
-    power_26 = 1 << 26
-
-    # Calculate the grid boundaries
-    grid_latitude_min = MIN_LAT + LATITUDE_RANGE * (grid_latitude_number / power_26)
-    grid_latitude_max = MIN_LAT + LATITUDE_RANGE * ((grid_latitude_number + 1) / power_26)
-    grid_longitude_min = MIN_LON + LONGITUDE_RANGE * (grid_longitude_number / power_26)
-    grid_longitude_max = MIN_LON + LONGITUDE_RANGE * ((grid_longitude_number + 1) / power_26)
-
-    # Calculate the center point of the grid cell
-    latitude = (grid_latitude_min + grid_latitude_max) / 2
-    longitude = (grid_longitude_min + grid_longitude_max) / 2
-
-    # GEOPOS returns Longitude then Latitude
-    return (longitude, latitude)
-
-
-def decode_geohash_to_coords(geo_code: int) -> tuple[float, float]:
-    """
-    Decodes geo code (WGS84) to tuple of (longitude, latitude)
-    """
-    # Align bits of both latitude and longitude to take even-numbered position
-    y = geo_code >> 1
-    x = geo_code
-
-    # Compact bits back to 32-bit ints
-    grid_latitude_number = compact_int64_to_int32(x)
-    grid_longitude_number = compact_int64_to_int32(y)
-
-    # normalized_longitude = grid_longitude_number + 0.5
-    # normalized_latitude = grid_latitude_number + 0.5
-
-    return convert_grid_numbers_to_coordinates(grid_latitude_number, grid_longitude_number)
 
 
 # Default Redis config
@@ -1305,6 +1153,35 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
             # client.sendall(response
             return response
 
+    elif command == "DEL":
+        if not arguments:
+            return b"-ERR wrong number of arguments for 'DEL' command\r\n"
+        
+        deleted_count = 0
+        for key in arguments:
+            deleted_count += delete_data_entry(key)
+        
+        response = b":" + str(deleted_count).encode() + b"\r\n"
+        return response
+
+    elif command == "INCRBY":
+        if len(arguments) != 2:
+            return b"-ERR wrong number of arguments for 'INCRBY' command\r\n"
+        
+        key = arguments[0]
+        try:
+            amount = int(arguments[1])
+        except ValueError:
+            return b"-ERR value is not an integer or out of range\r\n"
+        
+        new_value, error_msg = increment_key_value_by(key, amount)
+        
+        if error_msg:
+            return error_msg.encode()
+        
+        response = b":" + str(new_value).encode() + b"\r\n"
+        return response
+
     elif command == "MULTI":
 
         if is_client_in_multi(client):
@@ -1496,192 +1373,6 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
 
         # Return the final count as a RESP Integer
         response = b":" + str(final_acknowledged_count).encode() + b"\r\n"
-        return response
-
-    elif command == "GEOADD":
-        # GEOADD <key> <longitude> <latitude> <member>
-        if len(arguments) < 4:
-            response = b"-ERR wrong number of arguments for 'GEOADD' command\r\n"
-            return response
-
-        key = arguments[0]
-        longitude_str = arguments[1]
-        latitude_str = arguments[2]
-        member = arguments[3]
-
-        # 1. Validate coordinates
-        try:
-            longitude = float(longitude_str)
-            latitude = float(latitude_str)
-        except ValueError:
-            error_msg = b"-ERR value is not a valid float\r\n"
-            return error_msg
-
-        # 2. Check Longitude range [-180, 180]
-        if not (MIN_LON <= longitude <= MAX_LON):
-            error_msg = f"-ERR invalid longitude,latitude pair {longitude:.6f},{latitude:.6f}\r\n".encode()
-            return error_msg
-
-        # 3. Check Latitude range [-85.05112878, 85.05112878]
-        if not (MIN_LAT <= latitude <= MAX_LAT):
-            error_msg = f"-ERR invalid longitude,latitude pair {longitude:.6f},{latitude:.6f}\r\n".encode()
-            return error_msg
-
-        # 4. Persistence: Calculate geohash score and add to sorted set
-        score = encode_geohash(latitude, longitude)
-        score_str = str(score)
-
-        # add_to_sorted_set returns 1 if a new element was added, or 0 if an existing member was updated.
-        num_new_elements = add_to_sorted_set(key, member, score_str)
-
-        # 5. Return the count as a RESP Integer
-        response = b":" + str(num_new_elements).encode() + b"\r\n"
-        return response
-
-    elif command == "GEOPOS":
-        if len(arguments) < 2:
-            return b"-ERR wrong number of arguments for 'GEOPOS' command\r\n"
-
-        key = arguments[0]
-        members = arguments[1:]
-
-        final_response_parts = []
-
-        for member in members:
-            score_float = get_zscore(key, member)
-
-            if score_float is None:
-                # Member or key does not exist: Null Array (*-1\r\n)
-                final_response_parts.append(b"*-1\r\n")
-                continue
-
-            # Logic for FOUND member
-            score_int = int(score_float)
-
-            # Returns (longitude, latitude)
-            try:
-                longitude, latitude = decode_geohash_to_coords(score_int)
-            except Exception:
-                # Internal error during decoding
-                final_response_parts.append(b"*-1\r\n")
-                continue
-
-            # 4. Format coordinates as RESP Bulk Strings (Reverted to robust float string conversion)
-
-            # Use Python's default high-precision float string representation (str()),
-            # which is the most reliable way to maintain precision and avoid fragility.
-            lon_str = str(longitude)
-            lat_str = str(latitude)
-
-            # Format as Bulk Strings
-            lon_bytes = lon_str.encode()
-            lat_bytes = lat_str.encode()
-            lon_resp = b"$" + str(len(lon_bytes)).encode() + b"\r\n" + lon_bytes + b"\r\n"
-            lat_resp = b"$" + str(len(lat_bytes)).encode() + b"\r\n" + lat_bytes + b"\r\n"
-
-            # Final response for an existing member: *2\r\n<lon_resp><lat_resp>
-            member_resp = b"*2\r\n" + lon_resp + lat_resp
-            final_response_parts.append(member_resp)
-
-        # 5. Wrap all individual responses in the final RESP array
-        response = b"*" + str(len(final_response_parts)).encode() + b"\r\n" + b"".join(final_response_parts)
-        return response
-
-    elif command == "GEODIST":
-        if len(arguments) != 3:
-            return b"-ERR wrong number of arguments for 'GEODIST' command\r\n"
-
-        key = arguments[0]
-        member1 = arguments[1]
-        member2 = arguments[2]
-
-        # 1. Retrieve scores
-        score1_float = get_zscore(key, member1)
-        score2_float = get_zscore(key, member2)
-
-        if score1_float is None or score2_float is None:
-            # If key/member not found, return Null Bulk String
-            return b"$-1\r\n"
-
-        # 2. Decode scores to coordinates
-        try:
-            # decode_geohash_to_coords returns (longitude, latitude)
-            lon1, lat1 = decode_geohash_to_coords(int(score1_float))
-            lon2, lat2 = decode_geohash_to_coords(int(score2_float))
-        except Exception:
-            # Internal decoding error
-            return b"$-1\r\n"
-
-        # 3. Calculate distance
-        distance = haversine_distance(lon1, lat1, lon2, lat2)
-
-        # 4. Format and return as RESP Bulk String (meters)
-        # Use a string format for high precision (up to 4 decimal places required)
-        distance_str = f"{distance:.4f}".rstrip('0').rstrip('.')
-        if distance_str == "": distance_str = "0"
-
-        distance_bytes = distance_str.encode()
-
-        response = b"$" + str(len(distance_bytes)).encode() + b"\r\n" + distance_bytes + b"\r\n"
-        return response
-
-    elif command == "GEOSEARCH":
-        # GEOSEARCH <key> FROMLONLAT <lon> <lat> BYRADIUS <radius> <unit>
-        if len(arguments) != 7:
-            return b"-ERR wrong number of arguments for 'GEOSEARCH' command\r\n"
-
-        key = arguments[0]
-        from_keyword = arguments[1].upper()
-        by_keyword = arguments[4].upper()
-
-        if from_keyword != "FROMLONLAT" or by_keyword != "BYRADIUS":
-            return b"-ERR syntax error\r\n"
-
-        try:
-            center_lon = float(arguments[2])
-            center_lat = float(arguments[3])
-            radius = float(arguments[5])
-            unit = arguments[6]
-        except ValueError:
-            return b"-ERR invalid coordinates or radius\r\n"
-
-        # 1. Convert radius to meters
-        try:
-            search_radius_m = convert_to_meters(radius, unit)
-        except ValueError:
-            return b"-ERR invalid unit specified\r\n"
-
-        # 2. Get all members in the GeoKey (Sorted Set)
-        with DATA_LOCK:
-            if key not in SORTED_SETS:
-                return b"*0\r\n"
-            members_scores = SORTED_SETS.get(key, {}).items()
-
-        matching_members = []
-
-        # 3. Iterate, decode coordinates, and check distance
-        for member_name, score_float in members_scores:
-            try:
-                # Decode score to get location coordinates: returns (longitude, latitude)
-                member_lon, member_lat = decode_geohash_to_coords(int(score_float))
-            except Exception:
-                # Skip member if decoding fails
-                continue
-
-            # Calculate distance between search center and member
-            distance = haversine_distance(center_lon, center_lat, member_lon, member_lat)
-
-            # Check if the member is within the search radius (distance <= radius in meters)
-            if distance <= search_radius_m:
-                matching_members.append(member_name)
-
-        # 4. Return matching members as a RESP Array (order does not matter)
-        response_parts = []
-        for member in matching_members:
-            member_bytes = member.encode()
-            response_parts.append(b"$" + str(len(member_bytes)).encode() + b"\r\n" + member_bytes + b"\r\n")
-
-        response = b"*" + str(len(matching_members)).encode() + b"\r\n" + b"".join(response_parts)
         return response
 
     elif command == "QUIT":

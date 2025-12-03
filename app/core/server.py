@@ -31,6 +31,7 @@ Configuration:
 import socket
 import threading
 import sys
+from typing import Optional
 
 from app.protocol.constants import *
 from app.core.command_execution import handle_connection
@@ -113,7 +114,7 @@ def read_simple_string_response(sock: socket.socket, expected: bytes):
     return False
 
 
-def connect_to_master(listening_port: int) -> socket.socket | None:
+def connect_to_master(listening_port: int) -> Optional[socket.socket]:
     master_host = ce.MASTER_HOST
     master_port = ce.MASTER_PORT
     master_socket = None
@@ -226,6 +227,11 @@ def main():
         threading.Thread(target=replica_command_listener, args=(master_socket,), daemon=True).start()
 
     try:
+        # We explicitly set reuse_port=True which helps on Mac/Linux for rapid restarts.
+        # But to be systems-programming accurate/robust, let's also ensure REUSEADDR is understood.
+        # Python's socket.create_server sets SO_REUSEADDR by default if reuse_port is False.
+        # If reuse_port is True, it sets SO_REUSEPORT.
+        # Use reuse_port=True for best results on Mac.
         server_socket = socket.create_server(("localhost", port), reuse_port=True)
         print(f"Server: Starting server on localhost:{port}...")
         print("Server: Listening for connections...")

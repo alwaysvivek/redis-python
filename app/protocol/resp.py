@@ -6,7 +6,9 @@ RESP is a simple text-based protocol used by Redis for client-server communicati
 """
 
 
-def parse_resp_array(data: bytes) -> tuple[list[str] | None, int]:
+from typing import Optional
+
+def parse_resp_array(data: bytes) -> tuple[Optional[list[str]], int]:
     """
     Parse a RESP array from bytes.
     
