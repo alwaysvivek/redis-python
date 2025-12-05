@@ -4,14 +4,14 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="resp_server",
-    version="0.1.1",
+    name="resp-server",
+    version="0.2.0",
     author="Vivek Dagar",
     author_email="vivek@example.com",
     description="A lightweight, embeddable, pure-Python Redis-compatible server for testing",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/vivekdagar/redis-python",
+    url="https://github.com/vivekdagar/resp-server",
     packages=find_packages(exclude=["tests", "tests.*"]),
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -33,7 +33,7 @@ setup(
         ],
     },
     project_urls={
-        "Bug Reports": "https://github.com/vivekdagar/redis-python/issues",
-        "Source": "https://github.com/vivekdagar/redis-python",
+        "Bug Reports": "https://github.com/vivekdagar/resp-server/issues",
+        "Source": "https://github.com/vivekdagar/resp-server",
     },
 )
