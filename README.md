@@ -15,7 +15,7 @@ A lightweight, pure-Python implementation of a Redis-compatible server, designed
 *   **Zero Dependencies**: Pure Python standard library (no external dependencies to run the server).
 *   **Embeddable**: Run it inside your `pytest` suite without Docker or external Redis installation.
 *   **RESP Compatible**: Works with any Redis client library (`redis-py`, `node-redis`, `go-redis`, etc.).
-*   **Lite**: Supports Strings, Lists, Streams, Pub/Sub, and Expiration.
+*   **Lite**: Supports Strings, Lists, Streams, Pub/Sub, and Expiration  (Lazy).
 
 ## Installation
 
@@ -86,13 +86,13 @@ graph TD
     Datastore["resp_server/core/datastore.py<br/>(In-Memory DB)"]
     
     %% Utilities
-    Parser["resp_server/parser.py<br/>(RESP Parser)"]
+    RespProto["resp_server/protocol/resp.py<br/>(RESP Parser)"]
 
     %% Flow Relationships
     Main -->|1. Parses Args & Init| Server
     Server -->|2. Accepts Connections| CmdExec
     
-    CmdExec -->|3. Parses Raw Bytes| Parser
+    CmdExec -->|3. Parses Raw Bytes| RespProto
     CmdExec -->|4. Read/Write Data| Datastore
 ```
 
@@ -104,7 +104,7 @@ This section explains *what* each feature is, *how* it works internally, and *ho
 
 ### 1. Redis Serialization Protocol (RESP)
 *   **What it is**: The binary-safe protocol Redis uses to communicate.
-*   **How it works**: The `RESP Parser` (`resp_server/parser.py`) reads bytes from the TCP socket, identifying types by their first byte (`+` for strings, `$` for bulk strings, `*` for arrays). It recursively parses nested arrays.
+*   **How it works**: The `RESP Parser` (`resp_server/protocol/resp.py`) reads bytes from the TCP socket, identifying types by their first byte (`+` for strings, `$` for bulk strings, `*` for arrays). It recursively parses nested arrays.
 *   **Usage**: Transparent to the user. All clients (`redis-py`, `node-redis`, etc.) speak this automatically.
 
 ### 2. Strings & Expiration
@@ -148,6 +148,13 @@ This section explains *what* each feature is, *how* it works internally, and *ho
     # Client B
     r.publish("mychannel", "Hello Subscribers!")
     ```
+
+### 6. Utility Commands
+*   **PING**: Returns `PONG`. Used to test connection health.
+*   **ECHO**: Returns the given string. Useful for debugging connectivity.
+*   **TYPE**: Returns the type of value stored at a key (`string`, `list`, `stream`, etc.).
+*   **KEYS**: Returns a list of keys matching a pattern (only `*` wildcard supported).
+*   **CONFIG**: Supports `GET` for retrieving server configuration (e.g., `dir`, `dbfilename`).
 
 ---
 
