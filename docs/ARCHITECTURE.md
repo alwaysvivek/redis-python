@@ -16,7 +16,7 @@ graph TD
     Parser -->|Command| Executor[Command Executor]
     
     subgraph "Core Engine"
-        Executor -->|Read/Write| DataStore[Data Store (Memory)]
+        Executor -->|Read/Write| DataStore["Data Store (Memory)"]
         Executor -->|Pub/Sub| PubSub[Pub/Sub Manager]
         Executor -->|Streams| StreamEngine[Stream Engine]
     end
