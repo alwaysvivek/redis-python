@@ -35,6 +35,8 @@ Features:
 
 import time
 import threading
+import random
+from typing import Optional, Union, List, Tuple
 
 # ============================================================================
 # THREAD SAFETY - LOCKS
@@ -86,14 +88,63 @@ REPLICA_ACK_OFFSETS = {}
 
 # The central storage. Keys map to a dictionary containing value, type, and expiry metadata.
 # Example: {'mykey': {'type': 'string', 'value': 'myvalue', 'expiry': 1731671220000}}
+# Example: {'mykey': {'type': 'string', 'value': 'myvalue', 'expiry': 1731671220000, 'last_accessed': 1731671220000}}
 DATA_STORE = {}
+
+# Max keys for Approximate LRU Eviction
+# Keeping it small (100) to easily demonstrate eviction without using GBs of RAM.
+MAX_KEYS = 100
+
+def evict_if_needed():
+    """
+    Approximate LRU Eviction:
+    If DATA_STORE size >= MAX_KEYS, pick 5 random keys and evict the one
+    with the oldest 'last_accessed' timestamp.
+    """
+    # Note: caller must hold DATA_LOCK
+    if len(DATA_STORE) >= MAX_KEYS:
+        keys = list(DATA_STORE.keys())
+        # Pick up to 5 random keys
+        sample_size = min(len(keys), 5)
+        sample_keys = random.sample(keys, sample_size)
+        
+        lru_key = None
+        min_accessed = float('inf')
+        
+        for k in sample_keys:
+            entry = DATA_STORE[k]
+            # Default to 0 if not set (should be set on creation/access)
+            accessed = entry.get("last_accessed", 0)
+            if accessed < min_accessed:
+                min_accessed = accessed
+                lru_key = k
+        
+        if lru_key:
+            # We call delete_data_entry logic (inline or functional)
+            # Since we are already inside a lock (called by setters), we can't call delete_data_entry 
+            # if it re-acquires the lock (it DOES!).
+            # FIX: We need an internal _delete helper or replicate logic here.
+            # Replicating logic to avoid RLock/Lock issues (DATA_LOCK is not RLock).
+            
+            # --- Inline Delete Logic ---
+            if lru_key in DATA_STORE:
+                entry = DATA_STORE[lru_key]
+                type_ = entry.get("type")
+                if type_ == "sorted_set":
+                    if lru_key in SORTED_SETS:
+                        del SORTED_SETS[lru_key]
+                elif type_ == "stream":
+                    if lru_key in STREAMS:
+                        del STREAMS[lru_key]
+                del DATA_STORE[lru_key]
+                print(f"[LRU] Evicted key: {lru_key}")
 
 
 # ============================================================================
 # BASIC KEY-VALUE OPERATIONS
 # ============================================================================
 
-def get_data_entry(key: str) -> dict | None:
+def get_data_entry(key: str) -> Optional[dict]:
     """
     Retrieves a key, checks for expiration, and performs lazy deletion if expired.
     Returns the valid data entry dictionary or None if the key is missing/expired.
@@ -114,30 +165,70 @@ def get_data_entry(key: str) -> dict | None:
             del DATA_STORE[key]
             return None
 
+        # Update last_accessed for LRU
+        data_entry["last_accessed"] = int(time.time() * 1000)
         return data_entry
 
 
-def set_string(key: str, value: str, expiry_timestamp: int | None):
+def delete_data_entry(key: str) -> int:
+    """
+    Removes a key from the DATA_STORE and cleans up associated side structures
+    (SORTED_SETS, STREAMS, etc).
+    Returns 1 if the key was deleted, 0 if it didn't exist.
+    """
+    with DATA_LOCK:
+        if key in DATA_STORE:
+            # Check type to cleanup side structures
+            entry = DATA_STORE[key]
+            type_ = entry.get("type")
+            
+            if type_ == "sorted_set":
+                if key in SORTED_SETS:
+                    del SORTED_SETS[key]
+            elif type_ == "stream":
+                if key in STREAMS:
+                    del STREAMS[key]
+            
+            # Pub/Sub channels are separate from keyspace (CHANNEL_SUBSCRIBERS),
+            # so we don't delete them here (Redis DEL doesn't close channels).
+            
+            del DATA_STORE[key]
+            return 1
+        return 0
+
+
+
+def set_string(key: str, value: str, expiry_timestamp: Optional[int]):
     """
     Sets a key to a string value with optional expiration.
     """
     with DATA_LOCK:
+        # Check eviction before adding
+        if key not in DATA_STORE:
+            evict_if_needed()
+
         DATA_STORE[key] = {
             "type": "string",
             "value": value,
-            "expiry": expiry_timestamp
+            "expiry": expiry_timestamp,
+            "last_accessed": int(time.time() * 1000)
         }
 
 
-def set_list(key: str, elements: list[str], expiry_timestamp: int | None):
+def set_list(key: str, elements: list[str], expiry_timestamp: Optional[int]):
     """
     Sets a key to a list of strings with optional expiration.
     """
     with DATA_LOCK:
+        # Check eviction before adding
+        if key not in DATA_STORE:
+            evict_if_needed()
+
         DATA_STORE[key] = {
             "type": "list",
             "value": elements,
-            "expiry": expiry_timestamp
+            "expiry": expiry_timestamp,
+            "last_accessed": int(time.time() * 1000)
         }
 
 
@@ -208,7 +299,7 @@ def prepend_to_list(key: str, element: str):
             data_entry["value"].insert(0, element)
 
 
-def remove_elements_from_list(key: str, count: int) -> list[str] | None:
+def remove_elements_from_list(key: str, count: int) -> Optional[list[str]]:
     """
     Removes and returns the first elements from the list at the given key.
     Returns None if the list is empty or the key does not exist/is not a list.
@@ -453,10 +544,12 @@ def add_to_sorted_set(key: str, member: str, score_str: str) -> int:
             SORTED_SETS[key] = {}
 
         if key not in DATA_STORE:
+            evict_if_needed()  # Check limit before creating new key
             DATA_STORE[key] = {
                 "type": "sorted_set",
                 "value": SORTED_SETS[key],
-                "expiry": None
+                "expiry": None,
+                "last_accessed": int(time.time() * 1000)
             }
 
         # 2. Check if the member already exists
@@ -476,7 +569,7 @@ def num_sorted_set_members(key: str) -> int:
         return len(SORTED_SETS.get(key, {}))
 
 
-def get_sorted_set_rank(key: str, member: str) -> int | None:
+def get_sorted_set_rank(key: str, member: str) -> Optional[int]:
     """
     Returns the rank (0-based index) of the member in the sorted set stored at key.
     If the member does not exist, returns None.
@@ -533,7 +626,7 @@ def get_sorted_set_range(key: str, start: int, end: int) -> list[str]:
         return sorted_member_names[start:end + 1]
 
 
-def get_zscore(key: str, member: str) -> float | None:
+def get_zscore(key: str, member: str) -> Optional[float]:
     """
     Returns the score of the member in the sorted set stored at key.
     If the member does not exist, returns None.
@@ -562,7 +655,7 @@ def remove_from_sorted_set(key: str, member: str) -> int:
         return 1
 
 
-def _verify_and_parse_new_id(new_id_str: str, last_id_str: str | None) -> tuple[str | None, bytes | None]:
+def _verify_and_parse_new_id(new_id_str: str, last_id_str: Optional[str]) -> tuple[Optional[str], Optional[bytes]]:
     """
     Parses and validates the new ID against the last ID in the stream, 
     auto-generating the sequence number if 'ms-*' is present.
@@ -670,10 +763,12 @@ def xadd(key: str, id: str, fields: dict[str, str]) -> bytes:
         if key not in STREAMS:
             STREAMS[key] = []
         if key not in DATA_STORE:
+            evict_if_needed()
             DATA_STORE[key] = {
                 "type": "stream",
                 "value": None,  # Stream data is in STREAMS, not here
-                "expiry": None
+                "expiry": None,
+                "last_accessed": int(time.time() * 1000)
             }
 
         # Add Entry
@@ -783,7 +878,7 @@ def get_stream_max_id(key: str) -> str:
         return "0-0"
 
 
-def increment_key_value(key: str) -> tuple[int | None, str | None]:
+def increment_key_value(key: str) -> tuple[Optional[int], Optional[str]]:
     """
     Atomically increments the integer value of a key by one.
     Handles non-existent key, wrong type, and non-integer value errors.
@@ -796,10 +891,12 @@ def increment_key_value(key: str) -> tuple[int | None, str | None]:
         # 1. Key does not exist: Initialize to 0, then increment to 1.
         if data_entry is None:
             # We must set the key to "1" directly, not "0" then "1"
+            evict_if_needed()
             DATA_STORE[key] = {
                 "type": "string",
                 "value": "1",
-                "expiry": None
+                "expiry": None,
+                "last_accessed": int(time.time() * 1000)
             }
             return 1, None
 
@@ -835,6 +932,54 @@ def increment_key_value(key: str) -> tuple[int | None, str | None]:
         # 5. Update and return
         data_entry["value"] = str(new_value)
         return new_value, None
+
+
+def increment_key_value_by(key: str, amount: int) -> tuple[Optional[int], Optional[str]]:
+    """
+    Atomically increments the integer value of a key by a specific amount.
+    Handles non-existent key, wrong type, and non-integer value errors.
+    Returns: (new_value: int | None, error_message: str | None)
+    """
+    data_entry = get_data_entry(key)
+    with DATA_LOCK:
+        # 1. Key does not exist
+        if data_entry is None:
+            # Initialize to 0 + amount
+            evict_if_needed()
+            DATA_STORE[key] = {
+                "type": "string",
+                "value": str(amount),
+                "expiry": None,
+                "last_accessed": int(time.time() * 1000)
+            }
+            return amount, None
+
+        # 2. Key exists but is the wrong type
+        if data_entry.get("type") != "string":
+            return None, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+
+        current_value_str = data_entry["value"]
+
+        # 3. Key exists but not a valid integer
+        try:
+            current_value = int(current_value_str)
+        except ValueError:
+            return None, "-ERR value is not an integer or out of range\r\n"
+
+        # 4. Check overflow
+        MAX_64_BIT = 9223372036854775807
+        MIN_64_BIT = -9223372036854775808
+
+        # Python handles large ints automatically, but we check bounds to simulate 64-bit signed int limits
+        new_value = current_value + amount
+
+        if new_value > MAX_64_BIT or new_value < MIN_64_BIT:
+            return None, "-ERR increment or decrement would overflow\r\n"
+
+        # 5. Update and return
+        data_entry["value"] = str(new_value)
+        return new_value, None
+
 
 
 def is_client_in_multi(client) -> bool:
