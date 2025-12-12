@@ -1,7 +1,7 @@
 import unittest
 import time
 import threading
-from app.core.datastore import (
+from resp_server.core.datastore import (
     DATA_STORE, set_string, get_data_entry, set_list, 
     append_to_list, size_of_list, lrange_rtn, remove_elements_from_list, DATA_LOCK
 )
