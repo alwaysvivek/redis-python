@@ -1,5 +1,9 @@
 # RESP Server - Embeddable Redis-Compatible Server for Python
 
+[![PyPI version](https://badge.fury.io/py/resp-server.svg)](https://pypi.org/project/resp-server/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A lightweight, pure-Python implementation of a Redis-compatible server, designed primarily for **local development and unit testing**.
 
 > [!NOTE]
@@ -236,37 +240,6 @@ tests/test_integration.py ...                                            [ 84%]
 tests/test_protocol.py ..                                                [100%]
 
 ============================== 13 passed in 2.45s ===============================
-```
-
----
-
-## Publishing to PyPI
-
-Once you're ready to share this package:
-
-### 1. Build the Package
-
-```bash
-pip install flit
-flit build
-```
-
-### 2. Upload to TestPyPI (Recommended First)
-
-```bash
-flit publish --repository testpypi
-```
-
-### 3. Upload to PyPI
-
-```bash
-flit publish
-```
-
-### 4. Install from PyPI
-
-```bash
-pip install resp-server
 ```
 
 ---
