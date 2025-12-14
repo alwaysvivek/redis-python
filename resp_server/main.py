@@ -5,13 +5,12 @@ A lightweight, pure-Python Redis-compatible server designed for local developmen
 and unit testing. Zero dependencies, embeddable in test suites.
 
 Supported Features:
-- Strings (SET, GET with expiration)
+- Strings (SET, GET, INCR, INCRBY, DEL with optional expiration)
 - Lists (LPUSH, RPUSH, LPOP, LRANGE, LLEN, BLPOP)
-- Streams (XADD, XRANGE, XREAD)
-- Sorted Sets (ZADD, ZRANK, ZRANGE, ZCARD, ZSCORE, ZREM)
+- Streams (XADD, XRANGE, XREAD with blocking support)
 - Pub/Sub (SUBSCRIBE, PUBLISH, UNSUBSCRIBE)
-- Transactions (MULTI, EXEC, DISCARD, INCR)
 - Additional commands (PING, ECHO, TYPE, CONFIG, KEYS)
+- RDB persistence (loading only)
 
 Usage:
     # As a module
