@@ -7,9 +7,9 @@ A lightweight, pure-Python implementation of a Redis-compatible server, designed
 
 ## Features
 
-*   **Zero Dependencies**: Pure Python standard library.
-*   **Embeddable**: Run it inside your `pytest` suite.
-*   **RESP Compatible**: Works with standard clients like `redis-cli`, `redis-py`.
+*   **Zero Dependencies**: Pure Python standard library (no external dependencies to run the server).
+*   **Embeddable**: Run it inside your `pytest` suite without Docker or external Redis installation.
+*   **RESP Compatible**: Works with any Redis client library (`redis-py`, `node-redis`, `go-redis`, etc.).
 *   **Lite**: Supports Strings, Lists, Streams, Pub/Sub, and Expiration.
 
 ## Installation
