@@ -1,46 +1,29 @@
 """
 Redis Server Module
 
-This module implements the TCP server for handling client connections and
-manages replication functionality for master-slave architecture.
+This module implements the TCP server for handling client connections
 
 Main Components:
     - TCP server listening for client connections
     - Connection handler spawning threads for each client
-    - Replication listener for receiving commands from master
-    - Master connection setup for replica servers
-    - Command propagation to replica servers
-
-Server Modes:
-    - Master mode: Accepts client connections and propagates commands to replicas
-    - Replica mode: Connects to master, receives commands, and serves read requests
 
 Threading Model:
     - Main thread: Accepts new client connections
     - Client threads: One thread per client connection for command processing
-    - Replication thread: Listens for commands from master (replica mode only)
 
 Configuration:
     Server behavior is configured via command-line arguments:
     - --port: Server listening port (default: 6379)
-    - --replicaof: Master server address (enables replica mode)
     - --dir: Directory for RDB files
     - --dbfilename: RDB file name
 """
 
 import socket
-import threading
 import sys
+import threading
 from typing import Optional
 
-from resp_server.protocol.constants import *
 from resp_server.core.command_execution import handle_connection
-import resp_server.core.command_execution as ce
-
-
-# ============================================================================
-# REPLICATION - REPLICA SIDE
-# ============================================================================
 
 class Server:
     def __init__(self, port: int = 6379, host: str = "localhost"):

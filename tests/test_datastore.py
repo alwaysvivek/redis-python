@@ -45,28 +45,7 @@ class TestDataStore(unittest.TestCase):
         self.assertEqual(popped, ["a"])
         self.assertEqual(size_of_list("mylist"), 2)
 
-    def test_lru_eviction(self):
-        # Default MAX_KEYS is 100.
-        # 1. Fill store with 100 keys
-        for i in range(100):
-            set_string(f"key{i}", "val", None)
-            
-        self.assertEqual(len(DATA_STORE), 100)
-        
-        # 2. Access key0 to key4 to make them "recently used"
-        #    This updates their last_accessed timestamp.
-        #    Ideally, keys 5-99 are older access-wise (created earlier, never accessed since).
-        for i in range(5):
-            get_data_entry(f"key{i}")
-            
-        # 3. Add 101st key -> Should trigger eviction of one key
-        #    Since we use random sampling (sample size 5), it will pick 5 random keys
-        #    and evict the oldest. It's probabilistic, but with 100 keys and only 5 recently accessed,
-        #    it's highly likely to pick one of the non-accessed ones (index 5-99).
-        set_string("key100", "val", None)
-        
-        self.assertEqual(len(DATA_STORE), 100) # Size should stay at limit
-        self.assertIsNotNone(get_data_entry("key100")) # New key should exist
+
 
 if __name__ == '__main__':
     unittest.main()

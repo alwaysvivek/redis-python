@@ -11,8 +11,6 @@ Supported Command Categories:
     - Sorted Sets: ZADD, ZRANK, ZRANGE, ZCARD, ZSCORE, ZREM
     - Transactions: MULTI, EXEC, DISCARD, INCR
     - Pub/Sub: SUBSCRIBE, UNSUBSCRIBE, PUBLISH
-    - Replication: REPLCONF, PSYNC, INFO, WAIT
-    - Geospatial: GEOADD, GEOPOS, GEODIST, GEOSEARCH
 
 Architecture:
     The module uses a centralized command execution approach where each command
@@ -30,13 +28,12 @@ import os
 import threading
 import time
 
-from resp_server.parser import parsed_resp_array
+from resp_server.protocol.resp import parse_resp_array
 from resp_server.core.datastore import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, BLOCKING_STREAMS, BLOCKING_STREAMS_LOCK, \
-    CHANNEL_SUBSCRIBERS, DATA_LOCK, DATA_STORE, SORTED_SETS, STREAMS, WAIT_CONDITION, WAIT_LOCK, \
-    _serialize_command_to_resp_array, add_to_sorted_set, cleanup_blocked_client, enqueue_client_command, \
-    get_client_queued_commands, get_sorted_set_range, get_sorted_set_rank, get_stream_max_id, get_zscore, \
-    increment_key_value, increment_key_value_by, delete_data_entry, is_client_in_multi, is_client_subscribed, load_rdb_to_datastore, lrange_rtn, \
-    num_client_subscriptions, prepend_to_list, remove_elements_from_list, remove_from_sorted_set, set_client_in_multi, \
+    CHANNEL_SUBSCRIBERS, DATA_LOCK, DATA_STORE, STREAMS, \
+    cleanup_blocked_client, get_stream_max_id, \
+    increment_key_value, increment_key_value_by, delete_data_entry, is_client_subscribed, load_rdb_to_datastore, lrange_rtn, \
+    num_client_subscriptions, prepend_to_list, remove_elements_from_list, \
     size_of_list, append_to_list, existing_list, get_data_entry, set_list, set_string, subscribe, unsubscribe, xadd, \
     xrange, xread
 
@@ -44,8 +41,8 @@ from resp_server.core.datastore import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, 
 # CONFIGURATION AND CONSTANTS
 # ============================================================================
 
-# Commands that modify data and should be propagated to replicas
-WRITE_COMMANDS = {"SET", "LPUSH", "RPUSH", "LPOP", "ZADD", "ZREM", "XADD", "INCR", "INCRBY", "DEL"}
+# Commands that modify data
+WRITE_COMMANDS = {"SET", "LPUSH", "RPUSH", "LPOP", "XADD", "INCR", "INCRBY", "DEL"}
 
 
 
@@ -53,16 +50,8 @@ WRITE_COMMANDS = {"SET", "LPUSH", "RPUSH", "LPOP", "ZADD", "ZREM", "XADD", "INCR
 DIR = "."
 DB_FILENAME = "dump.rdb"
 
-SERVER_ROLE = "master"  # Default role is master
-MASTER_HOST = None
-MASTER_PORT = None
 
-MASTER_REPLID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"  # Hardcoded 40-char ID
-MASTER_REPL_OFFSET = 0  # Starts at 0
-REPLICA_REPL_OFFSET = 0
-MASTER_SOCKET = None
 
-REPLICA_SOCKETS = []
 
 # Define the 59-byte empty RDB file content (hexadecimal)
 # command_execution.py around line 40
@@ -132,7 +121,7 @@ def _xread_serialize_response(stream_data: dict[str, list[dict]]) -> bytes:
             entries_array_parts.append(entry_array_resp)
 
         # Combine all entries into the inner array
-        entries_resp = b"*" + str(len(entries_array_parts)).encode() + b"\r\n" + b"".join(entries_array_parts)
+        entries_resp = b"*" + str(len(entries_array_parts)).encode() + b"\r \n" + b"".join(entries_array_parts)
 
         # Combine [key, entries_resp]
         key_entries_resp = b"*2\r\n" + key_resp + entries_resp
@@ -168,11 +157,9 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         - Basic: PING, ECHO, SET, GET, TYPE, CONFIG, KEYS
         - Lists: LPUSH, RPUSH, LPOP, LRANGE, LLEN, BLPOP
         - Streams: XADD, XRANGE, XREAD
-        - Sorted Sets: ZADD, ZRANK, ZRANGE, ZCARD, ZSCORE, ZREM
-        - Transactions: MULTI, EXEC, DISCARD, INCR
         - Pub/Sub: SUBSCRIBE, UNSUBSCRIBE, PUBLISH
-        - Replication: REPLCONF, PSYNC, INFO, WAIT
-        - Geospatial: GEOADD, GEOPOS, GEODIST, GEOSEARCH
+        - Expiration: SET with EX/PX params
+        - Misc: INCR, INCRBY, DEL, QUIT
     """
     response = None
     """
@@ -201,75 +188,7 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
             # client.sendall(response
             return response
 
-    elif command == "REPLCONF":
-        # Check for REPLCONF GETACK * (Replica logic)
-        if len(arguments) == 2 and arguments[0].upper() == "GETACK" and arguments[1] == "*":
-            try:
-                # REPLCONF ACK <offset> - use the replica's current offset
-                global REPLICA_REPL_OFFSET  # Access the global offset
-                offset = REPLICA_REPL_OFFSET
-                offset_str = str(offset)
 
-                # Construct the RESP Array: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$LEN\r\n<OFFSET>\r\n
-                response = (
-                        b"*3\r\n" +  # Array of 3 elements
-                        b"$8\r\nREPLCONF\r\n" +
-                        b"$3\r\nACK\r\n" +
-                        b"$" + str(len(offset_str)).encode() + b"\r\n" +
-                        offset_str.encode() + b"\r\n"
-                )
-                return response
-            except Exception as e:
-                print(f"Error building REPLCONF ACK response: {e}")
-                # Return an error message to prevent unexpected silent failure
-                return b"-ERR Internal error building ACK\r\n"
-
-        # ADDED: Check for REPLCONF ACK <offset> (Master receives from replica)
-        elif len(arguments) == 2 and arguments[0].upper() == "ACK":
-            global REPLICA_ACK_OFFSETS
-
-            try:
-                replica_socket = client
-                ack_offset = int(arguments[1])
-
-                with WAIT_LOCK:  # Acquire lock to update shared state
-                    REPLICA_ACK_OFFSETS[replica_socket] = ack_offset
-                    # Wake up any waiting threads (the one executing WAIT)
-                    WAIT_CONDITION.notify_all()
-
-                return True
-            except ValueError:
-                return b"-ERR invalid offset value in ACK\r\n"
-
-        # Handshake REPLCONF commands (listening-port <PORT> and capa psync2)
-        response = b"+OK\r\n"
-        return response
-
-    elif command == "PSYNC":
-
-        # 2. Construct the FULLRESYNC response string
-        fullresync_response_str = f"+FULLRESYNC {MASTER_REPLID} {MASTER_REPL_OFFSET}\r\n"
-        fullresync_response_bytes = fullresync_response_str.encode()
-
-        # 3. Use the new RDB hex content and convert to binary bytes
-        # This is the RDB HEX string provided in the sample answer
-        EMPTY_RDB_HEX = (
-            "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
-        )
-        rdb_binary_contents = bytes.fromhex(EMPTY_RDB_HEX)
-        rdb_file_size = len(rdb_binary_contents)
-
-        # 4. Construct the RDB file bulk response header and combine with contents
-        # The format is $<length>\r\n<binary_contents>
-        rdb_header = b"$" + str(rdb_file_size).encode() + b"\r\n"
-        rdb_response_bytes = rdb_header + rdb_binary_contents
-
-        global REPLICA_SOCKETS  # <-- FIX 1: Use global to modify the variable
-        REPLICA_SOCKETS.append(client)
-
-        # 5. Return the two parts separately as a tuple
-        response = fullresync_response_bytes + rdb_response_bytes
-        return response
 
     elif command == "ECHO":
         if not arguments:
@@ -771,130 +690,6 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         # client.sendall(response
         return response
 
-    elif command == "ZADD":
-        if len(arguments) < 3:
-            response = b"-ERR wrong number of arguments for 'zadd' command\r\n"
-            # client.sendall(response
-            return response
-
-        set_key = arguments[0]
-
-        if len(arguments) > 3:
-            response = b"-ERR only single score/member pair supported in this stage\r\n"
-            # client.sendall(response
-            return response
-
-        # Extract the single score and member pair
-        score_str = arguments[1]
-        member = arguments[2]
-
-        try:
-            # The helper handles the addition/update and returns the count of new members (1 or 0).
-            num_new_elements = add_to_sorted_set(set_key, member, score_str)
-        except Exception:
-            # Catch exceptions from the helper (e.g., if score_str is not a number)
-            response = b"-ERR value is not a valid float\r\n"
-            # client.sendall(response
-            return response
-
-        # ZADD returns the number of *newly added* elements.
-        # Encode as a RESP Integer (e.g., :1\r\n)
-        response = b":" + str(num_new_elements).encode() + b"\r\n"
-        # client.sendall(response
-        return response
-
-    elif command == "ZRANK":
-        set_key = arguments[0] if len(arguments) > 0 else ""
-        member = arguments[1] if len(arguments) > 1 else ""
-
-        rank = get_sorted_set_rank(set_key, member)
-        if rank is None:
-            response = b"$-1\r\n"  # RESP Null Bulk String
-        else:
-            response = b":" + str(rank).encode() + b"\r\n"
-
-        # client.sendall(response
-        return response
-
-    elif command == "ZRANGE":
-        if len(arguments) < 3:
-            response = b"-ERR wrong number of arguments for 'ZRANGE' command\r\n"
-            # client.sendall(response
-            return response
-
-        set_key = arguments[0]
-        try:
-            start = int(arguments[1])
-            end = int(arguments[2])
-        except ValueError:
-            response = b"-ERR start or end is not an integer\r\n"
-            # client.sendall(response
-            return response
-
-        list_of_members = get_sorted_set_range(set_key, start, end)
-
-        response_parts = []
-        for member in list_of_members:
-            member_bytes = member.encode() if isinstance(member, str) else bytes(member)
-            response_parts.append(b"$" + str(len(member_bytes)).encode() + b"\r\n" + member_bytes + b"\r\n")
-        response = b"*" + str(len(list_of_members)).encode() + b"\r\n" + b"".join(response_parts)
-        # client.sendall(response
-        return response
-
-    elif command == "ZCARD":
-        if len(arguments) < 1:
-            response = b"-ERR wrong number of arguments for 'ZCARD' command\r\n"
-            # client.sendall(response
-            return response
-
-        set_key = arguments[0]
-
-        with DATA_LOCK:
-            if set_key in SORTED_SETS:
-                cardinality = len(SORTED_SETS[set_key])
-            else:
-                cardinality = 0
-
-        response = b":" + str(cardinality).encode() + b"\r\n"
-        # client.sendall(response
-        return response
-
-    elif command == "ZSCORE":
-        if len(arguments) < 2:
-            response = b"-ERR wrong number of arguments for 'ZSCORE' command\r\n"
-            # client.sendall(response
-            return response
-
-        set_key = arguments[0]
-        member = arguments[1]
-
-        score = get_zscore(set_key, member)
-
-        if score is None:
-            response = b"$-1\r\n"  # RESP Null Bulk String
-        else:
-            score_str = str(score)
-            score_bytes = score_str.encode()
-            length_bytes = str(len(score_bytes)).encode()
-            response = b"$" + length_bytes + b"\r\n" + score_bytes + b"\r\n"
-
-        # client.sendall(response
-        return response
-
-    elif command == "ZREM":
-        if len(arguments) < 2:
-            response = b"-ERR wrong number of arguments for 'ZREM' command\r\n"
-            # client.sendall(response
-            return response
-
-        set_key = arguments[0]
-        members = arguments[1]
-
-        removed_count = remove_from_sorted_set(set_key, members)
-
-        response = b":" + str(removed_count).encode() + b"\r\n"
-        # client.sendall(response
-        return response
 
     elif command == "TYPE":
         if len(arguments) < 1:
@@ -1182,198 +977,7 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         response = b":" + str(new_value).encode() + b"\r\n"
         return response
 
-    elif command == "MULTI":
 
-        if is_client_in_multi(client):
-            response = b"-ERR MULTI calls can not be nested\r\n"
-            # client.sendall(response
-            return response
-
-        # Set the client's state to "in transaction"
-        set_client_in_multi(client, True)
-
-        response = b"+OK\r\n"
-        # client.sendall(response
-        return response
-
-    elif command == "EXEC":
-        if is_client_in_multi(client):
-
-            queued_commands = get_client_queued_commands(client)
-            set_client_in_multi(client, False)
-
-            if not queued_commands:
-                # The required response for an empty transaction is an empty RESP Array.
-                response = b"*0\r\n"
-                # client.sendall(response
-                return response
-
-            # 4. Execute all queued commands and collect responses
-            response_parts = []
-            for cmd, args in queued_commands:
-                # Recursively call execute_single_command for each queued command
-                # The execution should not cause nested queuing, as the multi flag is now False
-                # and the recursive call won't re-trigger the main handle_command's checks.
-                try:
-                    # We pass the client socket for execution (e.g., SET/INCR needs it)
-                    cmd_response = execute_single_command(cmd, args, client)
-
-                    # EXEC only returns the actual response, never a connection close signal
-                    if cmd == "QUIT":
-                        cmd_response = b"+OK\r\n"  # We don't actually close the connection yet
-
-                    # Check for blocking/transaction control commands that might return False/True signals
-                    if isinstance(cmd_response, bool):
-                        # This should not happen if the refactoring is correct, but defensively use a generic error
-                        cmd_response = b"-ERR Internal execution error\r\n"
-
-                except Exception:
-                    # This catches errors during the execution of a queued command (e.g., wrong type)
-                    cmd_response = b"-ERR EXEC-failed during command execution\r\n"
-
-                response_parts.append(cmd_response)
-
-            # 5. Assemble the final RESP Array
-            final_response = b"*" + str(len(response_parts)).encode() + b"\r\n" + b"".join(response_parts)
-
-            return final_response
-        else:
-            response = b"-ERR EXEC without MULTI\r\n"
-            # client.sendall(response
-            return response
-
-    elif command == "DISCARD":
-        if is_client_in_multi(client):
-            response = b"+OK\r\n"
-            set_client_in_multi(client, False)
-            # client.sendall(response
-            return response
-        else:
-            response = b"-ERR DISCARD without MULTI\r\n"
-            # client.sendall(response
-            return response
-
-    elif command == "INFO":  # <--- ADDED INFO COMMAND
-        if len(arguments) == 0:
-            # INFO without arguments should return all sections,
-            # but for this stage, we'll only respond with the replication section if no argument is provided.
-            section = "replication"
-        elif len(arguments) == 1:
-            section = arguments[0].lower()
-        else:
-            response = b"-ERR wrong number of arguments for 'INFO' command\r\n"
-            return response
-
-        # Only support 'replication' section for this stage
-        if section == "replication":
-            # Use the global SERVER_ROLE
-            info_content = f"role:{SERVER_ROLE}\r\n"
-
-            # Add master_replid and master_repl_offset only if we are the master
-            if SERVER_ROLE == "master":
-                # Use the global hardcoded values
-                info_content += f"master_replid:{MASTER_REPLID}\r\n"
-                info_content += f"master_repl_offset:{MASTER_REPL_OFFSET}\r\n"
-
-            # Encode the string as a RESP Bulk String
-            info_bytes = info_content.encode()
-            length_bytes = str(len(info_bytes)).encode()
-
-            # Format: $length\r\ncontent\r\n
-            response = b"$" + length_bytes + b"\r\n" + info_bytes + b"\r\n"
-
-            return response
-
-        else:
-            # For unsupported sections, return an empty bulk string (or whatever
-            # the specific server behavior is, but an empty one is often safe for unimplemented)
-            # A simpler approach is to return a bulk string containing only the section header.
-            info_content = f"#{section.capitalize()}\r\n"
-            info_bytes = info_content.encode()
-            length_bytes = str(len(info_bytes)).encode()
-            response = b"$" + length_bytes + b"\r\n" + info_bytes + b"\r\n"
-            return response
-
-    elif command == "WAIT":
-        if len(arguments) != 2:
-            response = b"-ERR wrong number of arguments for 'WAIT' command\r\n"
-            return response
-
-        try:
-            num_replicas_required = int(arguments[0])
-            timeout_ms = int(arguments[1])
-        except ValueError:
-            response = b"-ERR numreplicas or timeout is not an integer\r\n"
-            return response
-
-        target_offset = MASTER_REPL_OFFSET
-        timeout_s = timeout_ms / 1000.0
-        start_time = time.time()
-
-        # Optimization: If target is 0, required replicas is 0, or no replicas are connected, return immediately.
-        if target_offset == 0 or num_replicas_required == 0 or not REPLICA_SOCKETS:
-            num_connected = len(REPLICA_SOCKETS)
-            return b":" + str(num_connected).encode() + b"\r\n"
-
-        # The master must send GETACK to all replicas to get their current offset
-        getack_command = b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
-
-        # 1. Initial send of GETACK to ALL replicas (Poll phase)
-        replicas_to_remove = []
-        for replica_socket in list(REPLICA_SOCKETS):
-            try:
-                replica_socket.sendall(getack_command)
-            except Exception:
-                # Mark failed sockets for removal
-                replicas_to_remove.append(replica_socket)
-
-        # Clean up dead replicas
-        for dead_socket in replicas_to_remove:
-            if dead_socket in REPLICA_SOCKETS:
-                REPLICA_SOCKETS.remove(dead_socket)
-                REPLICA_ACK_OFFSETS.pop(dead_socket, None)  # Also remove from ACK tracking
-
-        final_acknowledged_count = 0
-
-        with WAIT_LOCK:
-
-            # 2. Polling and waiting loop
-            while True:
-
-                # Check for timeout first
-                timeout_remaining = timeout_s - (time.time() - start_time)
-                if timeout_remaining <= 0:
-                    # Timeout expired
-                    break
-
-                # Check current acknowledged count
-                acknowledged_count = 0
-                for replica_socket in REPLICA_SOCKETS:
-                    # Use a default of 0 if replica hasn't ACKed yet
-                    ack_offset = REPLICA_ACK_OFFSETS.get(replica_socket, 0)
-                    if ack_offset >= target_offset:
-                        acknowledged_count += 1
-
-                # Check completion condition
-                if acknowledged_count >= num_replicas_required:
-                    final_acknowledged_count = acknowledged_count
-                    break
-
-                # Wait for notification or remaining timeout
-                WAIT_CONDITION.wait(timeout_remaining)
-
-            # If the loop finished due to timeout or early completion, calculate the final count
-            # Use the already calculated final_acknowledged_count if it met the requirement.
-            # If it broke due to timeout, we must check the last known counts.
-            if final_acknowledged_count == 0:
-                for replica_socket in REPLICA_SOCKETS:
-                    ack_offset = REPLICA_ACK_OFFSETS.get(replica_socket, 0)
-                    if ack_offset >= target_offset:
-                        final_acknowledged_count += 1
-
-        # Return the final count as a RESP Integer
-        response = b":" + str(final_acknowledged_count).encode() + b"\r\n"
-        return response
 
     elif command == "QUIT":
         response = b"+OK\r\n"
@@ -1384,97 +988,21 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
 
 
 def handle_command(command: str, arguments: list, client: socket.socket) -> bool:
-    client_address = client.getpeername()
-
-    # 1. TRANSACTION QUEUEING CHECK
-    if is_client_in_multi(client):
-        # Commands that must be executed immediately, even inside MULTI: MULTI, EXEC, DISCARD
-        TRANSACTION_CONTROL_COMMANDS = {"EXEC", "MULTI", "DISCARD"}
-
-        if command not in TRANSACTION_CONTROL_COMMANDS:
-            # Queue the command and respond with +QUEUED\r\n
-            enqueue_client_command(client, command, arguments)
-            response = b"+QUEUED\r\n"
-            client.sendall(response)
-            print(f"Sent: QUEUED response for command '{command}' to {client_address}.")
-            return True  # Signal that the command was handled (queued)
-
-    # 2. COMMAND EXECUTION
+    # --- COMMAND EXECUTION ---
     response_or_signal = execute_single_command(command, arguments, client)
 
-    # 3. PROPAGATION LOGIC (MASTER ROLE)
-    is_write_command = command in WRITE_COMMANDS
-    global REPLICA_SOCKETS
-    is_master_with_replicas = SERVER_ROLE == "master" and REPLICA_SOCKETS
-
-    if is_master_with_replicas and is_write_command:
-        # Propagate only if the command executed successfully (returned bytes, not an error)
-        if isinstance(response_or_signal, bytes) and not response_or_signal.startswith(b'-'):
-
-            # Reconstruct the raw RESP array
-            resp_array_to_send = _serialize_command_to_resp_array(command, arguments)
-            command_byte_size = len(resp_array_to_send)
-
-            # Iterate and send to ALL replicas
-            for replica_socket in list(REPLICA_SOCKETS):
-                try:
-                    replica_socket.sendall(resp_array_to_send)
-                    print(f"Propagation: Sent command '{command}' to replica {replica_socket.getpeername()}.")
-                except Exception as e:
-                    print(
-                        f"Propagation Error: Could not send command to replica {replica_socket.getpeername()}: {e}. Removing dead replica.")
-                    try:
-                        REPLICA_SOCKETS.remove(replica_socket)
-                    except ValueError:
-                        pass
-            global MASTER_REPL_OFFSET
-            MASTER_REPL_OFFSET += command_byte_size
-
-    # 4. SEND THE RESPONSE (CONSOLIDATED LOGIC)
-
-    # 4a. Check for internal signals (None means response was sent by another thread, e.g., XREAD BLOCK)
     if response_or_signal is None:
-        print(
-            f"Execution signal: Command '{command}' successfully processed (response sent by another thread or not required).")
         return True
 
-    # 4b. Handle response only if it's a bytes object (a valid RESP response)
-    if isinstance(response_or_signal, bytes):
-        global MASTER_SOCKET
+    if isinstance(response_or_signal, bool):
+        return response_or_signal
 
-        # --- RESPONSE SUPPRESSION CHECK (REPLICA ROLE) ---
-        # If we are a slave AND the command came on the master's replication connection, suppress the response.
-        if SERVER_ROLE == "slave" and client == MASTER_SOCKET:
-            # EXCEPTION: REPLCONF GETACK is the *only* command that requires a response back to the master.
-            is_replconf_getack = (
-                    command == "REPLCONF" and
-                    len(arguments) >= 2 and
-                    arguments[0].upper() == "GETACK"
-            )
-
-            if is_replconf_getack:
-                print(f"Replica: Executing REPLCONF GETACK and sending ACK back to master.")
-                # Fall through to the response sending logic below
-            else:
-                print(f"Replica: Executed propagated command '{command}' silently.")
-                return True  # Suppressed successfully, DO NOT send response.
-
-        # --- REGULAR CLIENT RESPONSE ---
-        client_address = client.getpeername()
+    # --- CLIENT RESPONSE ---
+    try:
         client.sendall(response_or_signal)
-
-        # Special case handling for PSYNC response (Master role)
-        if command == "PSYNC":
-            print(f"Sent: FULLRESYNC + RDB file for command '{command}' to {client_address}. Waiting 10ms...")
-            time.sleep(0.05)
-
-        # Log success and return True
-        print(f"Sent: Response for command '{command}' to {client_address}.")
-        return True
-
-    # 4c. Final return for commands that succeeded but didn't produce a bytes response
-    if response_or_signal is not False:
-        return True
+        print(f"Sent: Response for command '{command}' to {client.getpeername()}.")
+    except Exception as e:
+        print(f"Connection Error: Failed to send response: {e}")
 
     return True
 
@@ -1498,7 +1026,7 @@ def handle_connection(client: socket.socket, client_address):
             print(f"Received: Raw bytes from {client_address}: {data!r}")
 
             # The raw bytes are immediately sent to the parser to be translated into a usable Python list.
-            parsed_command, _ = parsed_resp_array(data)
+            parsed_command = parse_resp_array(data)
 
             if not parsed_command:
                 print(f"Received: Could not parse command from {client_address}. Closing connection.")

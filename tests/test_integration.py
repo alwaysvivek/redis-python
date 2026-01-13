@@ -13,7 +13,7 @@ class TestIntegration(unittest.TestCase):
         # Start the server in a separate process
         # Using sys.executable to ensure we use the same python interpreter
         cls.server_process = subprocess.Popen(
-            [sys.executable, "-m", "app.main", "--port", "6380"],
+            [sys.executable, "-m", "resp_server.main", "--port", "6380"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=os.getcwd()
