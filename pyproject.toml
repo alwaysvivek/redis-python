@@ -3,8 +3,8 @@ requires = ["flit_core >=3.2,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
-name = "resp_server"
-version = "0.1.1"
+name = "resp-server"
+version = "0.2.2"
 description = "A lightweight, embeddable, pure-Python Redis-compatible server for testing."
 readme = "README.md"
 authors = [{name = "Vivek Dagar", email = "vivek@example.com"}]
@@ -21,7 +21,7 @@ keywords = ["redis", "server", "embedded", "testing", "mock"]
 requires-python = ">=3.9"
 
 [project.urls]
-Home = "https://github.com/vivekdagar/redis-python"
+Home = "https://github.com/vivekdagar/resp-server"
 
 [project.scripts]
 resp-server = "resp_server.main:main"
