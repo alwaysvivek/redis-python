@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project is a high-performance, thread-safe, distributed key-value store implementation in Python, designed to be compatible with the Redis Serialization Protocol (RESP). It supports complex data structures (Strings, Lists, Streams, Sorted Sets), Pub/Sub messaging, and Master-Slave replication.
+This project is a high-performance, thread-safe, distributed key-value store implementation in Python, designed to be compatible with the Redis Serialization Protocol (RESP). It supports complex data structures (Strings, Lists, Streams, Sorted Sets) and Pub/Sub messaging.
 
 ## High-Level Architecture
 
@@ -21,9 +21,7 @@ graph TD
         Executor -->|Streams| StreamEngine[Stream Engine]
     end
     
-    subgraph "Replication"
-        Master[Master Server] -.->|Propagate| Replica[Replica Server]
-    end
+
 ```
 
 ## Data Storage & Concurrency
@@ -63,31 +61,7 @@ sequenceDiagram
     ServerThread-->>Client: +OK
 ```
 
-## Replication Mechanism
 
-The system implements Master-Slave replication compatible with the Redis protocol.
-
-### Handshake & Sync
-1.  **Replica Connects**: Replica sends `PING`, `REPLCONF listening-port`, `REPLCONF capa psync2`.
-2.  **PSYNC**: Replica sends `PSYNC ? -1` to request full synchronization.
-3.  **Snapshot Transfer**: Master sends `+FULLRESYNC` followed by a binary RDB snapshot (empty template in this implementation).
-4.  **Command Propagation**: Master continuously streams write commands (`SET`, `DEL`, etc.) to all connected replicas.
-
-```mermaid
-sequenceDiagram
-    participant Replica
-    participant Master
-    
-    Replica->>Master: PING
-    Master-->>Replica: +PONG
-    Replica->>Master: REPLCONF listening-port 6380
-    Master-->>Replica: +OK
-    Replica->>Master: PSYNC ? -1
-    Master-->>Replica: +FULLRESYNC <ID> <OFFSET>
-    Master-->>Replica: $<len>\r\n<RDB_PAYLOAD>
-    Note right of Master: Replication Stream Begins
-    Master->>Replica: SET key value
-```
 
 ## Supported Features
 

@@ -5,6 +5,10 @@ from typing import Optional
 @dataclass
 class Config:
     """Server configuration container."""
+
+    def __init__(self):
+        pass
+
     host: str = "localhost"
     port: int = 6379
     is_replica: bool = False

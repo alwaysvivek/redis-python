@@ -5,10 +5,9 @@ This module provides the core data storage for the Redis server.
 Supports: Strings, Lists, Streams, and Pub/Sub.
 """
 
-import time
 import threading
-import random
-from typing import Optional, Union, List, Tuple, Dict, Any
+import time
+from typing import Optional, Union
 
 # ============================================================================
 # THREAD SAFETY - LOCKS

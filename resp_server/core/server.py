@@ -19,11 +19,11 @@ Configuration:
 """
 
 import socket
-import sys
 import threading
-from typing import Optional
+import click
 
 from resp_server.core.command_execution import handle_connection
+
 
 class Server:
     def __init__(self, port: int = 6379, host: str = "localhost"):
@@ -74,30 +74,12 @@ class Server:
             except Exception:
                 pass
 
-def main():
-    port = 6379
-    args = sys.argv[1:]
-    
-    # Simple argument parsing for the CLI entry point
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg == "--port":
-            if i + 1 < len(args):
-                try:
-                    port = int(args[i + 1])
-                    i += 2
-                    continue
-                except ValueError:
-                    pass
-        elif arg == "--dir" or arg == "--dbfilename":
-            # Keeping these for now as placeholder for future persistence, 
-            # but currently they don't do much in the Lite version.
-             if i + 1 < len(args):
-                 i += 2
-                 continue
-        i += 1
-
+@click.command()
+@click.option('--port', default=6379, type=int, help='Server listening port (default: 6379)')
+@click.option('--dir', 'rdb_dir', default='.', help='Directory for RDB files')
+@click.option('--dbfilename', default='dump.rdb', help='RDB file name')
+def main(port, rdb_dir, dbfilename):
+    print(f"Server Configuration: Port={port}, RDB Directory={rdb_dir}, DB Filename={dbfilename}")
     server = Server(port=port)
     try:
         server.start()

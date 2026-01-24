@@ -19,6 +19,7 @@ classifiers = [
 ]
 keywords = ["redis", "server", "embedded", "testing", "mock"]
 requires-python = ">=3.9"
+dependencies = ["click"]
 
 [project.urls]
 Home = "https://github.com/vivekdagar/resp-server"
