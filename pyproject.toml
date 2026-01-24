@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "resp-server"
-version = "0.2.2"
+version = "0.2.3"
 description = "A lightweight, embeddable, pure-Python Redis-compatible server for testing."
 readme = "README.md"
 authors = [{name = "Vivek Dagar", email = "vivek@example.com"}]

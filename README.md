@@ -12,7 +12,7 @@ A lightweight, pure-Python implementation of a Redis-compatible server, designed
 
 ## Features
 
-*   **Zero Dependencies**: Pure Python standard library (no external dependencies to run the server).
+*   **Minimal Dependencies**: Uses `click` for CLI (pure-Python standard library otherwise).
 *   **Embeddable**: Run it inside your `pytest` suite without Docker or external Redis installation.
 *   **RESP Compatible**: Works with any Redis client library (`redis-py`, `node-redis`, `go-redis`, etc.).
 *   **Lite**: Supports Strings, Lists, Streams, Pub/Sub, and Expiration  (Lazy).
@@ -259,3 +259,9 @@ This project was built as part of the [CodeCrafters Redis Challenge](https://cod
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.
+
+## Changelog
+
+### v0.2.3
+*   Refactored CLI to use `click` library for robust argument parsing.
+
