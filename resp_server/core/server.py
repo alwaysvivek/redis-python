@@ -23,6 +23,7 @@ import threading
 import click
 
 from resp_server.core.command_execution import handle_connection
+from resp_server.config import config
 
 
 class Server:
@@ -31,12 +32,13 @@ class Server:
         self.host = host
         self.running = False
         self.server_socket = None
-        self.threads = []
 
     def start(self):
         """Starts the Redis-compatible server."""
         try:
             self.server_socket = socket.create_server((self.host, self.port), reuse_port=True)
+            # Set a timeout so we can periodically check self.running used for graceful shutdown
+            self.server_socket.settimeout(1.0)
             self.running = True
             print(f"Server: Starting server on {self.host}:{self.port}...")
             print("Server: Listening for connections...")
@@ -49,21 +51,14 @@ class Server:
     def _accept_loop(self):
         while self.running:
             try:
-                # Set a timeout so we can periodically check self.running used for graceful shutdown
-                self.server_socket.settimeout(1.0)
-                try:
-                    connection, client_address = self.server_socket.accept()
-                    t = threading.Thread(target=handle_connection, args=(connection, client_address))
-                    t.start()
-                    self.threads.append(t)
-                except socket.timeout:
-                    continue
+                connection, client_address = self.server_socket.accept()
+                threading.Thread(target=handle_connection, args=(connection, client_address)).start()
+            except socket.timeout:
+                continue
             except Exception as e:
-                # If socket is closed, break
-                if not self.running:
-                    break
-                print(f"Server Error: Exception during connection acceptance: {e}")
-                break
+                if self.running:
+                    print(f"Server Error: Exception during connection acceptance: {e}")
+                break   # break if socket is closed as well
 
     def stop(self):
         """Stops the server."""
@@ -79,6 +74,11 @@ class Server:
 @click.option('--dir', 'rdb_dir', default='.', help='Directory for RDB files')
 @click.option('--dbfilename', default='dump.rdb', help='RDB file name')
 def main(port, rdb_dir, dbfilename):
+    # Populate the global config object
+    config.port = port
+    config.rdb_dir = rdb_dir
+    config.db_filename = dbfilename
+    
     print(f"Server Configuration: Port={port}, RDB Directory={rdb_dir}, DB Filename={dbfilename}")
     server = Server(port=port)
     try:

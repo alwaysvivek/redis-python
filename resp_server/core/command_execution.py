@@ -1,134 +1,81 @@
 """
 Redis Command Execution Module
-
-This module handles the execution of all Redis commands supported by the server.
-It processes commands received from clients and returns appropriate RESP-formatted responses.
-
-Supported Command Categories:
-    - Basic Commands: PING, ECHO, SET, GET, TYPE, CONFIG, KEYS
-    - Lists: LPUSH, RPUSH, LPOP, LRANGE, LLEN, BLPOP
-    - Streams: XADD, XRANGE, XREAD (with blocking support)
-    - Sorted Sets: ZADD, ZRANK, ZRANGE, ZCARD, ZSCORE, ZREM
-    - Transactions: MULTI, EXEC, DISCARD, INCR
-    - Pub/Sub: SUBSCRIBE, UNSUBSCRIBE, PUBLISH
-
-Architecture:
-    The module uses a centralized command execution approach where each command
-    is handled by dedicated logic within execute_single_command(). Commands are
-    parsed using RESP protocol and responses are formatted according to Redis specs.
-
-Thread Safety:
-    All data operations use locks from the data_store module to ensure thread-safe
-    concurrent access. Blocking operations use condition variables for coordination.
 """
 
-import socket
-import sys
 import os
+import socket
 import threading
 import time
 
-from resp_server.protocol.resp import parse_resp_array
+from resp_server.config import config
+from resp_server.core.context import ClientContext
 from resp_server.core.datastore import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, BLOCKING_STREAMS, BLOCKING_STREAMS_LOCK, \
     CHANNEL_SUBSCRIBERS, DATA_LOCK, DATA_STORE, STREAMS, \
     cleanup_blocked_client, get_stream_max_id, \
-    increment_key_value, increment_key_value_by, delete_data_entry, is_client_subscribed, load_rdb_to_datastore, lrange_rtn, \
+    increment_key_value, increment_key_value_by, delete_data_entry, is_client_subscribed, load_rdb_to_datastore, \
+    lrange_rtn, \
     num_client_subscriptions, prepend_to_list, remove_elements_from_list, \
     size_of_list, append_to_list, existing_list, get_data_entry, set_list, set_string, subscribe, unsubscribe, xadd, \
     xrange, xread
+from resp_server.protocol.resp import parse_resp_array, encode_bulk_string, encode_null_bulk_string, encode_error, encode_simple_string, encode_array, encode_integer
 
 # ============================================================================
 # CONFIGURATION AND CONSTANTS
-# ============================================================================
 
 # Commands that modify data
-WRITE_COMMANDS = {"SET", "LPUSH", "RPUSH", "LPOP", "XADD", "INCR", "INCRBY", "DEL"}
-
-
-
-# Default Redis config
-DIR = "."
-DB_FILENAME = "dump.rdb"
-
-
-
+WRITE_COMMANDS = {
+    "SET", "LPUSH", "RPUSH", "LPOP", "XADD", "INCR", "INCRBY", "DEL"
+}
 
 # Define the 59-byte empty RDB file content (hexadecimal)
-# command_execution.py around line 40
-
-# Define the 59-byte empty RDB file content (hexadecimal)
-# CHANGE: Use the RDB HEX string provided in the sample answer
-EMPTY_RDB_HEX = (
-    "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
+EMPTY_RDB_BYTES = bytes.fromhex(
+    "524544495330303131fa0972656469732d76657205372e322e30"
+    "fa0a72656469732d62697473c040fa056374696d65c26d08bc65"
+    "fa08757365642d6d656dc2b0c41000fa08616f662d62617365c0"
+    "00fff06e3bfec0ff5aa2"
 )
-empty_rdb_bytes = bytes.fromhex(EMPTY_RDB_HEX)
+
 # RDB_FILE_SIZE will be determined by the actual length of the new hex string.
-RDB_FILE_SIZE = len(empty_rdb_bytes)
-RDB_HEADER = b"$" + str(RDB_FILE_SIZE).encode() + b"\r\n"  # Dynamically create the header bytes
-# Note: This is equivalent to b"$102\r\n" if the hex string is 102 bytes long.
+RDB_HEADER = f"${len(EMPTY_RDB_BYTES)}\r\n".encode()
 
-# Parse args like --dir /path --dbfilename file.rdb
-args = sys.argv[1:]
-for i in range(0, len(args), 2):
-    if args[i] == "--dir":
-        DIR = args[i + 1]
-    elif args[i] == "--dbfilename":
-        DB_FILENAME = args[i + 1]
+def initialize_datastore():
+    rdb_path = os.path.join(config.rdb_dir, config.db_filename)
+    if os.path.exists(rdb_path):
+        DATA_STORE.update(load_rdb_to_datastore(rdb_path))
+    else:
+        print(f"RDB file not found at {rdb_path}, starting with empty DATA_STORE.")
 
-RDB_PATH = os.path.join(DIR, DB_FILENAME)
 
-# Only load if file exists
-if os.path.exists(RDB_PATH):
-    DATA_STORE.update(load_rdb_to_datastore(RDB_PATH))
-else:
-    print(f"RDB file not found at {RDB_PATH}, starting with empty DATA_STORE.")
-
+initialize_datastore()
 
 def _xread_serialize_response(stream_data: dict[str, list[dict]]) -> bytes:
     """Serializes the result of xread into a RESP array response."""
     if not stream_data:
-        return b"*-1\r\n"
+        return encode_null_bulk_string().replace(b"$-1", b"*-1")
 
-        # Outer Array: Array of [key, [entry1, entry2, ...]]
-    # *N\r\n
-    outer_response_parts = []
+    # Outer Array: Array of [key, [entry1, entry2, ...]] # *N\r\n
+    outer_array_items = []
 
     for key, entries in stream_data.items():
-        # Array for [key, list of entries] -> *2\r\n
-        key_resp = b"$" + str(len(key.encode())).encode() + b"\r\n" + key.encode() + b"\r\n"
+        encoded_entries = []
 
-        # Array for list of entries -> *M\r\n
-        entries_array_parts = []
         for entry in entries:
-            entry_id = entry["id"]
-            fields = entry["fields"]
+            fields_items = []
+            for field, value in entry["fields"].items():
+                fields_items.append(encode_bulk_string(field))
+                fields_items.append(encode_bulk_string(value))
 
-            # Array for [id, [field1, value1, field2, value2, ...]] -> *2\r\n
-            id_resp = b"$" + str(len(entry_id.encode())).encode() + b"\r\n" + entry_id.encode() + b"\r\n"
+            encoded_entries.append(encode_array([
+                encode_bulk_string(entry["id"]),
+                encode_array(fields_items)
+            ]))
 
-            # Array for field/value pairs -> *2K\r\n
-            fields_array_parts = []
-            for field, value in fields.items():
-                field_bytes = field.encode()
-                value_bytes = value.encode()
-                fields_array_parts.append(b"$" + str(len(field_bytes)).encode() + b"\r\n" + field_bytes + b"\r\n")
-                fields_array_parts.append(b"$" + str(len(value_bytes)).encode() + b"\r\n" + value_bytes + b"\r\n")
+        outer_array_items.append(encode_array([
+            encode_bulk_string(key),
+            encode_array(encoded_entries)
+        ]))
 
-            fields_array_resp = b"*" + str(len(fields) * 2).encode() + b"\r\n" + b"".join(fields_array_parts)
-
-            # Combine [id, fields_array]
-            entry_array_resp = b"*2\r\n" + id_resp + fields_array_resp
-            entries_array_parts.append(entry_array_resp)
-
-        # Combine all entries into the inner array
-        entries_resp = b"*" + str(len(entries_array_parts)).encode() + b"\r \n" + b"".join(entries_array_parts)
-
-        # Combine [key, entries_resp]
-        key_entries_resp = b"*2\r\n" + key_resp + entries_resp
-        outer_response_parts.append(key_entries_resp)
-
-    # Final response: Array of [key, entries] arrays
-    return b"*" + str(len(outer_response_parts)).encode() + b"\r\n" + b"".join(outer_response_parts)
+    return encode_array(outer_array_items)
 
 
 # ============================================================================
@@ -137,141 +84,56 @@ def _xread_serialize_response(stream_data: dict[str, list[dict]]) -> bytes:
 # This section contains the main command execution logic for all supported Redis commands.
 # Commands are organized by category for easier navigation and maintenance.
 
-def execute_single_command(command: str, arguments: list, client: socket.socket):
+def execute_single_command(command: str, arguments: list, client: ClientContext):
     """
     Executes a single Redis command and returns the appropriate response.
-    
-    This is the main command dispatcher that routes commands to their respective handlers.
-    Each command category (basic, lists, streams, etc.) has dedicated logic within this function.
-    
-    Args:
-        command: The Redis command to execute (e.g., 'SET', 'GET', 'LPUSH')
-        arguments: List of arguments for the command
-        client: The client socket connection (used for pub/sub and transactions)
-    
     Returns:
-        bytes: RESP-formatted response to send back to the client
-        bool: True for special commands that don't return a response (like REPLCONF ACK)
-    
-    Command Categories:
-        - Basic: PING, ECHO, SET, GET, TYPE, CONFIG, KEYS
-        - Lists: LPUSH, RPUSH, LPOP, LRANGE, LLEN, BLPOP
-        - Streams: XADD, XRANGE, XREAD
-        - Pub/Sub: SUBSCRIBE, UNSUBSCRIBE, PUBLISH
-        - Expiration: SET with EX/PX params
-        - Misc: INCR, INCRBY, DEL, QUIT
-    """
-    response = None
-    """
-    Returns True if the command was processed successfully, False otherwise (e.g., unknown command).
+        bytes: RESP-formatted response
+        bool: True for special commands
     """
     if is_client_subscribed(client):
         ALLOWED_COMMANDS_WHEN_SUBSCRIBED = {"SUBSCRIBE", "UNSUBSCRIBE", "PING", "QUIT", "PSUBSCRIBE", "PUNSUBSCRIBE"}
         if command not in ALLOWED_COMMANDS_WHEN_SUBSCRIBED:
-            response = b"-ERR Can't execute '" + command.encode() + b"' when client is subscribed\r\n"
-            return response
+            return encode_error(f"Can't execute '{command}' when client is subscribed")
 
     if command == "PING":
-        if is_client_subscribed(client):
-            response_parts = []
-            pong_bytes = "pong".encode()
-            response_parts.append(b"$" + str(len(pong_bytes)).encode() + b"\r\n" + pong_bytes + b"\r\n")
-
-            empty_bytes = "".encode()
-            response_parts.append(b"$" + str(len(empty_bytes)).encode() + b"\r\n" + empty_bytes + b"\r\n")
-
-            response = b"*" + str(len(response_parts)).encode() + b"\r\n" + b"".join(response_parts)
-            # client.sendall(response
-            return response
-        else:
-            response = b"+PONG\r\n"
-            # client.sendall(response
-            return response
-
-
+        return encode_simple_string("PONG") if (not is_client_subscribed(client)) \
+            else b"*2\r\n" + encode_bulk_string("pong") + encode_bulk_string("")
 
     elif command == "ECHO":
-        if not arguments:
-            response = b"-ERR wrong number of arguments for 'echo' command\r\n"
-            # client.sendall(response
-            return response
-
-        # msg_str is like 'Hey' and we must convert back to RESP bulk string.
-        msg_str = arguments[0]
-
-        # encode back to bytes
-        msg_bytes = msg_str.encode()
-
-        # grab length of msg_bytes and construct RESP bulk string
-        length_bytes = str(len(msg_bytes)).encode()
-
-        # b"$3\r\nhey\r\n"
-        response = b"$" + length_bytes + b"\r\n" + msg_bytes + b"\r\n"
-
-        # client.sendall(response
-        return response
+        return encode_bulk_string(arguments[0]) if arguments \
+            else encode_error("wrong number of arguments for 'echo' command")
 
     elif command == "SET":
         if len(arguments) < 2:
-            response = b"-ERR wrong number of arguments for 'set' command\r\n"
-            # client.sendall(response
-            return response
+            return encode_error("wrong number of arguments for 'set' command")
 
-        key = arguments[0]
-        value = arguments[1]
+        key, value = arguments[0], arguments[1]
         duration_ms = None
 
-        # Option Parsing Loop
         i = 2
-        while i < len(arguments):
+        if i < len(arguments):
             option = arguments[i].upper()
 
-            if option in ("EX", "PX"):
-                # Check if the duration argument exists
-                if i + 1 >= len(arguments):
-                    response = f"-ERR syntax error\r\n".encode()
-                    # client.sendall(response
-                    return response
+            if option not in ("EX", "PX") or i + 1 >= len(arguments):
+                return encode_error("syntax error")
 
-                try:
-                    # Convert the duration argument (string) to an integer first
-                    duration = int(arguments[i + 1])
+            try:
+                ttl = int(arguments[i + 1])
+            except ValueError:
+                return encode_error("value is not an integer or out of range")
 
-                    if option == "EX":
-                        duration_ms = duration * 1000  # Convert seconds to milliseconds
-                    elif option == "PX":
-                        duration_ms = duration
-
-                    i += 2  # Skip the option and its value
-                    break  # Assuming only one EX/PX option
-
-                except ValueError:
-                    # Catch case where duration is not an integer
-                    response = b"-ERR value is not an integer or out of range\r\n"
-                    # client.sendall(response
-                    return response
-            else:
-                # Handle unrecognized option
-                response = f"-ERR syntax error\r\n".encode()
-                # client.sendall(response
-                return response
+            duration_ms = ttl * 1000 if option == "EX" else ttl
 
         current_time = int(time.time() * 1000)
-
-        # Calculate the absolute expiration timestamp
         expiry_timestamp = current_time + duration_ms if duration_ms is not None else None
 
-        # Use the data store function to set the value safely
         set_string(key, value, expiry_timestamp)
-
-        response = b"+OK\r\n"
-        # client.sendall(response
-        return response
+        return encode_simple_string("OK")
 
     elif command == "GET":
         if not arguments:
             response = b"-ERR wrong number of arguments for 'get' command\r\n"
-            # client.sendall(response
             return response
 
         key = arguments[0]
@@ -280,42 +142,31 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         data_entry = get_data_entry(key)
 
         if data_entry is None:
-            response = b"$-1\r\n"  # RESP Null Bulk String
+            response = encode_null_bulk_string()  # RESP Null Bulk String
         else:
             # Check for correct type (important: we only support string GET for now)
-            if data_entry.get("type") != "string":
-                response = b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
-            else:
-                # Construct the Bulk String response
-                value = data_entry["value"]
-                value_bytes = value.encode()
-                length_bytes = str(len(value_bytes)).encode()
-                response = b"$" + length_bytes + b"\r\n" + value_bytes + b"\r\n"
+            response = (
+                encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+                if data_entry.get("type") != "string"
+                else encode_bulk_string(data_entry["value"])
+            )
 
         # client.sendall(response
         return response
 
     elif command == "LRANGE":
         if not arguments or len(arguments) < 3:
-            response = b"-ERR wrong number of arguments for 'lrange' command\r\n"
-            # client.sendall(response
-            return response
+            return encode_error("wrong number of arguments for 'lrange' command")
 
         list_key = arguments[0]
         start = int(arguments[1])
         end = int(arguments[2])
 
         list_elements = lrange_rtn(list_key, start, end)
-
-        response_parts = []
-        for element in list_elements:
-            element_bytes = element.encode()
-            length_bytes = str(len(element_bytes)).encode()
-            response_parts.append(b"$" + length_bytes + b"\r\n" + element_bytes + b"\r\n")
-
-        response = b"*" + str(len(list_elements)).encode() + b"\r\n" + b"".join(response_parts)
-        # client.sendall(response
-        return response
+        
+        # Convert strings to encoded bulk strings
+        encoded_elements = [encode_bulk_string(e) for e in list_elements]
+        return encode_array(encoded_elements)
 
     elif command == "LPUSH":
         if not arguments:
@@ -326,8 +177,6 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         list_key = arguments[0]
         elements = arguments[1:]
 
-        size = 0
-
         if existing_list(list_key):
             for element in elements:
                 prepend_to_list(list_key, element)
@@ -335,59 +184,39 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
             set_list(list_key, elements, None)
 
         size = size_of_list(list_key)
-        response = b":{size}\r\n".replace(b"{size}", str(size).encode())
-        # client.sendall(response
-        return response
+        return encode_integer(size)
 
     elif command == "LLEN":
         if not arguments:
-            response = b"-ERR wrong number of arguments for 'llen' command\r\n"
-            # client.sendall(response
-            return response
+            return encode_error("wrong number of arguments for 'llen' command")
 
         list_key = arguments[0]
         size = size_of_list(list_key)
-        response = b":{size}\r\n".replace(b"{size}", str(size).encode())
-        # client.sendall(response
-        return response
+        return encode_integer(size)
 
     elif command == "LPOP":
         if not arguments:
-            response = b"-ERR wrong number of arguments for 'lpop' command\r\n"
-            # client.sendall(response
-            return response
+            return encode_error("wrong number of arguments for 'lpop' command")
 
         list_key = arguments[0]
         arguments = arguments[1:]
 
         if not existing_list(list_key):
-            response = b"$-1\r\n"  # RESP Null Bulk String
-            # client.sendall(response
-            return response
+            return encode_null_bulk_string()
 
-        if arguments == []:
+        if not arguments:
             list_elements = remove_elements_from_list(list_key, 1)
         else:
             list_elements = remove_elements_from_list(list_key, int(arguments[0]))
         if list_elements is None:
-            response = b"$-1\r\n"  # RESP Null Bulk String
-            # client.sendall(response
-            return response
+            return encode_null_bulk_string()
 
-        response_parts = []
-        for element in list_elements:
-            element_bytes = element.encode()
-            length_bytes = str(len(element_bytes)).encode()
-            response_parts.append(b"$" + length_bytes + b"\r\n" + element_bytes + b"\r\n")
+        encoded_elements = [encode_bulk_string(e) for e in list_elements]
 
-        if len(response_parts) == 1:
-            response = b"$" + str(len(list_elements[0].encode())).encode() + b"\r\n" + list_elements[
-                0].encode() + b"\r\n"
+        if len(encoded_elements) == 1:
+            return encoded_elements[0]
         else:
-            response = b"*" + str(len(list_elements)).encode() + b"\r\n" + b"".join(response_parts)
-
-        # client.sendall(response
-        return response
+            return encode_array(encoded_elements)
 
     elif command == "RPUSH":
         # 1. Argument and Key setup
@@ -398,36 +227,21 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         list_key = arguments[0]
         elements = arguments[1:]
 
-        # 2. Add all elements to the list (the helper functions handle DATA_LOCK internally)
-        #    - If the key already holds a list, append each pushed element.
-        #    - Otherwise create a new list key with the elements.
-        #    This models Redis: RPUSH adds elements to the tail.
+        # 2. Add elements (see ARCHITECTURE.md for locking details)
         if existing_list(list_key):
-            for element in elements:
-                append_to_list(list_key, element)
+             for element in elements:
+                 append_to_list(list_key, element)
         else:
-            set_list(list_key, elements, None)
+             set_list(list_key, elements, None)
 
-        # IMPORTANT: compute the size *after insertion* and store it.
-        # Redis's RPUSH returns the list length *after* the push operation,
-        # even if the server immediately serves a blocked client afterwards.
-        size_to_report = size_of_list(list_key)  # Size that must be returned to RPUSH caller
+        size_to_report = size_of_list(list_key)
 
-        # 3. Check if there are blocked clients waiting on this list
-        #    We will wake up the longest-waiting client (FIFO). The structure is:
-        #      BLOCKING_CLIENTS = { 'list_key': [cond1, cond2, ...], ... }
-        #    Each entry is a threading.Condition used to notify the blocked thread.
+        # 3. Check for blocked clients (wake up FIFO)
         blocked_client_condition = None
 
-        # Acquire the BLOCKING_CLIENTS_LOCK while we inspect / modify the shared dict.
-        # This prevents races where multiple RPUSH/BLPOP threads change the waiters concurrently.
         with BLOCKING_CLIENTS_LOCK:
-            # If there are waiters, pop the first one (FIFO: the longest-waiting client).
             if list_key in BLOCKING_CLIENTS and BLOCKING_CLIENTS[list_key]:
                 blocked_client_condition = BLOCKING_CLIENTS[list_key].pop(0)
-                # Note: we intentionally *don't* delete the list_key here even if empty;
-                # your code deletes the dict key later when cleaning up waiters on timeout.
-                # The critical property is FIFO ordering via pop(0).
 
         if blocked_client_condition:
             # 3a. When serving a blocked client, we must remove an element from the list.
@@ -445,10 +259,10 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
                 #     *2\r\n
                 #     $<len(key)>\r\n<key>\r\n
                 #     $<len(element)>\r\n<element>\r\n
-                key_resp = b"$" + str(len(list_key.encode())).encode() + b"\r\n" + list_key.encode() + b"\r\n"
-                element_resp = b"$" + str(
-                    len(popped_element.encode())).encode() + b"\r\n" + popped_element.encode() + b"\r\n"
-                blpop_response = b"*2\r\n" + key_resp + element_resp
+                blpop_response = encode_array([
+                    encode_bulk_string(list_key),
+                    encode_bulk_string(popped_element)
+                ])
 
                 blocked_client_socket = blocked_client_condition.client_socket
 
@@ -463,18 +277,12 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
                     # (or let its wait time out and the cleanup code remove it).
                     pass
 
-                # 3c. Wake up the blocked thread by notifying its Condition.
-                #      According to Condition semantics, notify() should be called while
-                #      holding the Condition's own lock, so we enter the Condition context.
-                #      The blocked thread is waiting on the same Condition and will be awakened.
+                # 3c. Wake up the blocked thread. 
                 with blocked_client_condition:
                     blocked_client_condition.notify()
 
-                    # 4. Final step: Send the RPUSH response (always the size immediately after insertion)
-        #    This is the value clients expect (e.g., ":1\r\n")
-        response = b":{size}\r\n".replace(b"{size}", str(size_to_report).encode())
-        # client.sendall(response
-        return response
+        # 4. Return size
+        return encode_integer(size_to_report)
 
     elif command == "BLPOP":
         # 1. Argument and Key setup
@@ -502,10 +310,10 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
                 popped_element = list_elements[0]
 
                 # Construct the RESP array [key, popped_element] and send it.
-                key_resp = b"$" + str(len(list_key.encode())).encode() + b"\r\n" + list_key.encode() + b"\r\n"
-                element_resp = b"$" + str(
-                    len(popped_element.encode())).encode() + b"\r\n" + popped_element.encode() + b"\r\n"
-                response = b"*2\r\n" + key_resp + element_resp
+                response = encode_array([
+                    encode_bulk_string(list_key),
+                    encode_bulk_string(popped_element)
+                ])
 
                 # client.sendall(response
                 return response
@@ -525,13 +333,10 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
             BLOCKING_CLIENTS.setdefault(list_key, []).append(client_condition)
 
         # Wait for notification or timeout.
-        # Note: timeout==0 handled as "block indefinitely" (wait() without timeout).
         with client_condition:
             if timeout == 0:
-                # Block forever until notify()
                 notified = client_condition.wait()
             else:
-                # Block up to `timeout` seconds; wait() returns True if notified, False if timed out
                 notified = client_condition.wait(timeout)
 
         # 4. Post-block handling
@@ -567,9 +372,9 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         value = None
 
         if param_name == "dir":
-            value = DIR
+            value = config.rdb_dir
         elif param_name == "dbfilename":
-            value = DB_FILENAME
+            value = config.db_filename
 
         # 2. Handle unknown parameters
         if value is None:
@@ -580,26 +385,11 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
 
         # --- Correct RESP Serialization ---
 
-        # 3. Encode strings
-        param_bytes = param_name.encode('utf-8')
-        value_bytes = value.encode('utf-8')
-
-        # 4. Construct the RESP Array: *2 [param_name] [value]
-        response = (
-            # *2 (Array of 2 elements)
-                b"*2\r\n" +
-                # $len(param_name)
-                b"$" + str(len(param_bytes)).encode('utf-8') + b"\r\n" +
-                # param_name
-                param_bytes + b"\r\n" +
-                # $len(value)
-                b"$" + str(len(value_bytes)).encode('utf-8') + b"\r\n" +
-                # value
-                value_bytes + b"\r\n"
-        )
-
-        # client.sendall(response
-        return response
+        # 3. Encode strings and return Array
+        return encode_array([
+            encode_bulk_string(param_name),
+            encode_bulk_string(value)
+        ])
 
     elif command == "KEYS":
         if len(arguments) != 1:
@@ -616,16 +406,8 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
                 if pattern == "*" or pattern == key:
                     matching_keys.append(key)
 
-        # Construct RESP Array response
-        response_parts = []
-        for key in matching_keys:
-            key_bytes = key.encode()
-            length_bytes = str(len(key_bytes)).encode()
-            response_parts.append(b"$" + length_bytes + b"\r\n" + key_bytes + b"\r\n")
-
-        response = b"*" + str(len(matching_keys)).encode() + b"\r\n" + b"".join(response_parts)
-        # client.sendall(response
-        return response
+        encoded_keys = [encode_bulk_string(k) for k in matching_keys]
+        return encode_array(encoded_keys)
 
     elif command == "SUBSCRIBE":
         # Construct RESP Array response
@@ -633,14 +415,11 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         subscribe(client, channel)
         num_subscriptions = num_client_subscriptions(client)
 
-        response_parts = []
-        response_parts.append(b"$" + str(len("subscribe".encode())).encode() + b"\r\n" + b"subscribe" + b"\r\n")
-        response_parts.append(b"$" + str(len(channel.encode())).encode() + b"\r\n" + channel.encode() + b"\r\n")
-        response_parts.append(b":" + str(num_subscriptions).encode() + b"\r\n")  # Number of subscriptions
-
-        response = b"*" + str(len(response_parts)).encode() + b"\r\n" + b"".join(response_parts)
-        # client.sendall(response
-        return response
+        return encode_array([
+            encode_bulk_string("subscribe"),
+            encode_bulk_string(channel),
+            encode_integer(num_subscriptions)
+        ])
 
     elif command == "PUBLISH":
         if len(arguments) != 2:
@@ -657,14 +436,11 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
                 subscribers = CHANNEL_SUBSCRIBERS[channel]
                 for subscriber in subscribers:
                     # Construct the message RESP Array
-                    response_parts = []
-                    response_parts.append(b"$" + str(len("message".encode())).encode() + b"\r\n" + b"message" + b"\r\n")
-                    response_parts.append(
-                        b"$" + str(len(channel.encode())).encode() + b"\r\n" + channel.encode() + b"\r\n")
-                    response_parts.append(
-                        b"$" + str(len(message.encode())).encode() + b"\r\n" + message.encode() + b"\r\n")
-
-                    response = b"*" + str(len(response_parts)).encode() + b"\r\n" + b"".join(response_parts)
+                    response = encode_array([
+                        encode_bulk_string("message"),
+                        encode_bulk_string(channel),
+                        encode_bulk_string(message)
+                    ])
                     try:
                         subscriber.sendall(response)
                         recipients += 1
@@ -672,9 +448,7 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
                         pass  # Ignore send errors for subscribers
 
         # Send number of recipients to publisher
-        response = b":" + str(recipients).encode() + b"\r\n"
-        # client.sendall(response
-        return response
+        return encode_integer(recipients)
 
     elif command == "UNSUBSCRIBE":
         channel = arguments[0] if arguments else ""
@@ -682,13 +456,11 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         unsubscribe(client, channel)
         num_subscriptions = num_client_subscriptions(client)
 
-        response_parts = []
-        response_parts.append(b"$" + str(len("unsubscribe".encode())).encode() + b"\r\n" + b"unsubscribe" + b"\r\n")
-        response_parts.append(b"$" + str(len(channel.encode())).encode() + b"\r\n" + channel.encode() + b"\r\n")
-        response_parts.append(b":" + str(num_subscriptions).encode() + b"\r\n")  # Number of subscriptions
-        response = b"*" + str(len(response_parts)).encode() + b"\r\n" + b"".join(response_parts)
-        # client.sendall(response
-        return response
+        return encode_array([
+            encode_bulk_string("unsubscribe"),
+            encode_bulk_string(channel),
+            encode_integer(num_subscriptions)
+        ])
 
 
     elif command == "TYPE":
@@ -706,9 +478,7 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
         else:
             type_str = data_entry.get("type", "none")
 
-        type_bytes = type_str.encode()
-        length_bytes = str(len(type_bytes)).encode()
-        response = b"$" + length_bytes + b"\r\n" + type_bytes + b"\r\n"
+        return encode_bulk_string(type_str)
 
         # client.sendall(response
         return response
@@ -764,12 +534,11 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
                     except Exception:
                         pass  # Ignore send errors
 
-                    # Wake up the blocked thread by notifying its Condition.
+                    # Wake up blocked thread
                     with blocked_client_condition:
                         blocked_client_condition.notify()
 
-            length_bytes = str(len(raw_id_bytes)).encode()
-            response = b"$" + length_bytes + b"\r\n" + raw_id_bytes + b"\r\n"
+            return encode_bulk_string(raw_id_bytes.decode())
             # client.sendall(response
             return response
 
@@ -785,34 +554,19 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
 
         entries = xrange(key, start_id, end_id)
 
-        response_parts = []
+        encoded_entries = []
         for entry in entries:
-            entry_id = entry["id"]
-            fields = entry["fields"]
+            fields_items = []
+            for field, value in entry["fields"].items():
+                fields_items.append(encode_bulk_string(field))
+                fields_items.append(encode_bulk_string(value))
 
-            # Construct RESP Array for each entry: [entry_id, [field1, value1, field2, value2, ...]]
-            entry_parts = []
-            entry_id_bytes = entry_id.encode()
-            entry_parts.append(b"$" + str(len(entry_id_bytes)).encode() + b"\r\n" + entry_id_bytes + b"\r\n")
+            encoded_entries.append(encode_array([
+                encode_bulk_string(entry["id"]),
+                encode_array(fields_items)
+            ]))
 
-            # Now construct the inner array of fields and values
-            field_value_parts = []
-            for field, value in fields.items():
-                field_bytes = field.encode()
-                value_bytes = value.encode()
-                field_value_parts.append(b"$" + str(len(field_bytes)).encode() + b"\r\n" + field_bytes + b"\r\n")
-                field_value_parts.append(b"$" + str(len(value_bytes)).encode() + b"\r\n" + value_bytes + b"\r\n")
-
-            # Combine field/value parts into an array
-            field_value_array = b"*" + str(len(field_value_parts)).encode() + b"\r\n" + b"".join(field_value_parts)
-            entry_parts.append(field_value_array)
-
-            # Combine entry parts into an array
-            entry_array = b"*" + str(len(entry_parts)).encode() + b"\r\n" + b"".join(entry_parts)
-            response_parts.append(entry_array)
-        response = b"*" + str(len(response_parts)).encode() + b"\r\n" + b"".join(response_parts)
-        # client.sendall(response
-        return response
+        return encode_array(encoded_entries)
 
     elif command == "XREAD":
         # Format: XREAD [BLOCK <ms>] STREAMS key1 key2 ... id1 id2 ...
@@ -929,9 +683,7 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
 
     elif command == "INCR":
         if len(arguments) != 1:
-            response = b"-ERR wrong number of arguments for 'incr' command\r\n"
-            # client.sendall(response
-            return response
+            return encode_error("wrong number of arguments for 'incr' command")
 
         key = arguments[0]
 
@@ -944,62 +696,52 @@ def execute_single_command(command: str, arguments: list, client: socket.socket)
             return error_message.encode()
         else:
             # Success: new_value is an integer. Return RESP Integer.
-            response = b":" + str(new_value).encode() + b"\r\n"
-            # client.sendall(response
-            return response
+            return encode_integer(new_value)
 
     elif command == "DEL":
         if not arguments:
-            return b"-ERR wrong number of arguments for 'DEL' command\r\n"
+            return encode_error("wrong number of arguments for 'DEL' command")
         
         deleted_count = 0
         for key in arguments:
             deleted_count += delete_data_entry(key)
         
-        response = b":" + str(deleted_count).encode() + b"\r\n"
-        return response
+        return encode_integer(deleted_count)
 
     elif command == "INCRBY":
         if len(arguments) != 2:
-            return b"-ERR wrong number of arguments for 'INCRBY' command\r\n"
+            return encode_error("wrong number of arguments for 'INCRBY' command")
         
         key = arguments[0]
         try:
             amount = int(arguments[1])
         except ValueError:
-            return b"-ERR value is not an integer or out of range\r\n"
+            return encode_error("value is not an integer or out of range")
         
         new_value, error_msg = increment_key_value_by(key, amount)
         
         if error_msg:
             return error_msg.encode()
         
-        response = b":" + str(new_value).encode() + b"\r\n"
-        return response
+        return encode_integer(new_value)
 
 
 
     elif command == "QUIT":
-        response = b"+OK\r\n"
-        # client.sendall(response
-        return response
+        return encode_simple_string("OK")
 
-    return b"-ERR unknown command '" + command.encode() + b"'\r\n"
+    return encode_error(f"unknown command '{command}'")
 
 
-def handle_command(command: str, arguments: list, client: socket.socket) -> bool:
-    # --- COMMAND EXECUTION ---
-    response_or_signal = execute_single_command(command, arguments, client)
+def handle_command(command: str, arguments: list, client: ClientContext) -> bool:
+    result = execute_single_command(command, arguments, client) # --- COMMAND EXECUTION ---
 
-    if response_or_signal is None:
-        return True
-
-    if isinstance(response_or_signal, bool):
-        return response_or_signal
+    if result is None or isinstance(result, bool):
+        return result if isinstance(result, bool) else True
 
     # --- CLIENT RESPONSE ---
     try:
-        client.sendall(response_or_signal)
+        client.sendall(result)
         print(f"Sent: Response for command '{command}' to {client.getpeername()}.")
     except Exception as e:
         print(f"Connection Error: Failed to send response: {e}")
@@ -1014,13 +756,19 @@ def handle_connection(client: socket.socket, client_address):
     """
     print(f"Connection: New connection from {client_address}")
 
-    with client:
+    ctx = ClientContext(conn=client, addr=client_address)   # Client context
+
+    with ctx:
         while True:
             # The thread waits for the client to send a command. When you run {redis-cli ECHO hey}, the server receives the raw RESP bytes: data = b'*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n'
-            data = client.recv(4096)
+            try:
+                data = client.recv(4096)
+            except OSError:
+                break
+
             if not data:
                 print(f"Connection: Client {client_address} closed connection.")
-                cleanup_blocked_client(client)
+                cleanup_blocked_client(ctx)
                 break
 
             print(f"Received: Raw bytes from {client_address}: {data!r}")
@@ -1038,4 +786,4 @@ def handle_connection(client: socket.socket, client_address):
             print(f"Command: Parsed command: {command}, Arguments: {arguments}")
 
             # Delegate command execution to the router
-            handle_command(command, arguments, client)
+            handle_command(command, arguments, ctx)

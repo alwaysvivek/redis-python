@@ -1,39 +1,38 @@
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
 import socket
-import threading
-import datetime
-
-
-def log(*args):
-    """Lightweight internal logger."""
-    print("[Context]", *args)
-
 
 @dataclass
-class RedisContext:
-    """
-    Shared runtime state for the Redis clone.
-    Replaces scattered globals like MASTER_HOST, SERVER_ROLE, etc.
-    """
+class ClientContext:
+    conn: socket.socket
+    addr: tuple
+    is_subscribed: bool = False
+    
+    def sendall(self, data: bytes):
+        """Proxy to socket.sendall"""
+        self.conn.sendall(data)
 
-    # --- Core configuration ---
-    def __init__(self):
-        pass
+    def getpeername(self):
+        """Proxy to socket.getpeername"""
+        return self.conn.getpeername()
 
-    config: Any  # This will be an instance of Config (from config.py)
+    def fileno(self):
+        """Proxy to socket.fileno"""
+        return self.conn.fileno()
 
-    # --- Data Store (key-value or stream objects) ---
-    db: Dict[str, Any] = field(default_factory=dict)
+    def close(self):
+        self.conn.close()
 
-    # --- Pub/Sub system ---
-    pubsub_channels: Dict[str, list[socket.socket]] = field(default_factory=dict)
+    def __hash__(self):
+        """Allow ClientContext to be used in sets (like CHANNEL_SUBSCRIBERS)"""
+        return hash(self.conn)
 
-    # --- RDB (Persistence) ---
-    rdb_last_save_time: Optional[datetime.datetime] = None
-    rdb_dir: Optional[str] = None
-    rdb_filename: Optional[str] = None
+    def __eq__(self, other):
+        if isinstance(other, ClientContext):
+            return self.conn == other.conn
+        return False
 
-    # --- Thread safety ---
-    db_lock: threading.Lock = field(default_factory=threading.Lock)
+    def __enter__(self):
+        return self
 
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()

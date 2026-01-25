@@ -73,3 +73,30 @@ sequenceDiagram
 | **Sorted Sets** | `ZADD`, `ZRANK`, `ZRANGE`, `ZCARD`, `ZSCORE`, `ZREM` |
 | **Pub/Sub** | `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` |
 | **Transactions** | `MULTI`, `EXEC`, `DISCARD` (Basic queuing) |
+
+## Command Execution Module
+
+This module handles the execution of all Redis commands supported by the server. It processes commands received from clients and returns appropriate RESP-formatted responses.
+
+### Architecture
+The module uses a centralized command execution approach where each command is handled by dedicated logic within `execute_single_command()`. Commands are parsed using RESP protocol and responses are formatted according to Redis specs.
+
+### Thread Safety
+
+## Command Logic Details
+
+### Blocking Operations (BLPOP, XREAD)
+The server supports blocking operations where clients wait for data to arrive. This mechanism is implemented using `threading.Condition` variables.
+
+#### Lists (RPUSH mixed with BLPOP)
+*   **Waiting**: When a client executes `BLPOP` on an empty list, a new `threading.Condition` is created and added to a `BLOCKING_CLIENTS` dictionary under the target key. The thread then waits on this condition.
+*   **Notification**: When another client executes `RPUSH`:
+    1.  It checks `BLOCKING_CLIENTS` for any waiters on the target list.
+    2.  It pops the *first* waiter (FIFO) from the list.
+    3.  It immediately sends the response (the pushed element) to the waiting client's socket *from the RPUSH thread*.
+    4.  It notifies the condition variable to wake up the waiting thread, which then returns clean.
+*   **Race Prevention**: A `BLOCKING_CLIENTS_LOCK` is used to ensure atomic access to the waiters dictionary, preventing race conditions between concurrent pushes and pops.
+
+#### Streams (XADD mixed with XREAD BLOCK)
+*   **Mechanism**: Similar to Lists, `XREAD BLOCK` registers a condition variable in `BLOCKING_STREAMS`.
+*   **Notification**: `XADD` checks for waiters after successfully adding an entry. It creates the standard `XREAD` response for the new entry and sends it directly to the waiting client's socket before notifying the thread.
