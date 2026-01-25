@@ -2,7 +2,7 @@
 
 [![PyPI version](https://badge.fury.io/py/resp-server.svg)](https://pypi.org/project/resp-server/)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![CI](https://github.com/alwaysvivek/redis-python/actions/workflows/ci.yml/badge.svg)](https://github.com/alwaysvivek/redis-python/actions/workflows/ci.yml)
+[![Status](https://img.shields.io/badge/Status-Active-success.svg)](https://github.com/alwaysvivek/resp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A lightweight, pure-Python implementation of a Redis-compatible server, designed primarily for **local development and unit testing**.
