@@ -4,6 +4,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Status](https://img.shields.io/badge/Status-Active-success.svg)](https://github.com/alwaysvivek/resp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Publish to PyPI](https://github.com/alwaysvivek/resp-server/actions/workflows/publish.yml/badge.svg)](https://github.com/alwaysvivek/resp-server/actions/workflows/publish.yml)
 
 A lightweight, pure-Python implementation of a Redis-compatible server, designed primarily for **local development and unit testing**.
 
